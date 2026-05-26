@@ -4,6 +4,12 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
+/**
+ * Resolves MIME types for RPlayer assets served through the local proxy.
+ *
+ * <p>The proxy prefers extension-based MIME types so WebView can render files
+ * correctly even when the upstream gateway provides a download-oriented response.</p>
+ */
 final class MimeTypes {
     private static final Map<String, String> MIME_BY_EXTENSION = new HashMap<>();
 
@@ -35,6 +41,13 @@ final class MimeTypes {
     private MimeTypes() {
     }
 
+    /**
+     * Resolves the best MIME type for a request path.
+     *
+     * @param path request path, including an optional query string
+     * @param fallback upstream MIME type returned by the gateway
+     * @return extension-based MIME type, fallback MIME type, or application/octet-stream
+     */
     static String fromPath(String path, String fallback) {
         String extension = extensionFromPath(path);
         String mimeType = MIME_BY_EXTENSION.get(extension);
@@ -50,6 +63,12 @@ final class MimeTypes {
         return "application/octet-stream";
     }
 
+    /**
+     * Extracts a lowercase file extension from a path and ignores query parameters.
+     *
+     * @param path request path to inspect
+     * @return extension without the dot, or an empty string when none is present
+     */
     private static String extensionFromPath(String path) {
         int queryStart = path.indexOf('?');
         String cleanPath = queryStart >= 0 ? path.substring(0, queryStart) : path;

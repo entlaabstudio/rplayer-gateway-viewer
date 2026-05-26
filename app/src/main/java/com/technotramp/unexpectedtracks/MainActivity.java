@@ -19,6 +19,12 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
+/**
+ * Main Android entry point for the single-album viewer.
+ *
+ * <p>The activity starts the local gateway proxy, configures a locked-down
+ * WebView, and loads the fixed RPlayer album through the proxy URL.</p>
+ */
 public final class MainActivity extends Activity {
     private static final String LOG_TAG = "RPlayerViewer";
 
@@ -26,6 +32,9 @@ public final class MainActivity extends Activity {
     private WebView webView;
     private TextView errorView;
 
+    /**
+     * Initializes the activity, starts the local proxy, and loads the viewer URL.
+     */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -43,6 +52,9 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Releases WebView and proxy resources when the activity is destroyed.
+     */
     @Override
     protected void onDestroy() {
         if (webView != null) {
@@ -56,6 +68,10 @@ public final class MainActivity extends Activity {
         super.onDestroy();
     }
 
+    /**
+     * Enables the WebView features required by RPlayer while keeping file and
+     * content access disabled.
+     */
     @SuppressLint("SetJavaScriptEnabled")
     private void configureWebView() {
         WebSettings settings = webView.getSettings();
@@ -88,6 +104,9 @@ public final class MainActivity extends Activity {
         });
     }
 
+    /**
+     * Creates the minimal view hierarchy: the WebView and a full-screen error view.
+     */
     private void createLayout() {
         FrameLayout root = new FrameLayout(this);
         webView = new WebView(this);
@@ -112,11 +131,17 @@ public final class MainActivity extends Activity {
         setContentView(root);
     }
 
+    /**
+     * Displays a startup error when the local proxy cannot be created.
+     */
     private void showError(String message) {
         errorView.setText(message);
         errorView.setVisibility(TextView.VISIBLE);
     }
 
+    /**
+     * Returns a small plain-text response for navigation blocked by the WebView policy.
+     */
     private WebResourceResponse blockedResponse() {
         byte[] body = "External addresses are blocked in this prototype.".getBytes(StandardCharsets.UTF_8);
         return new WebResourceResponse(

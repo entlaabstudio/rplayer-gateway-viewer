@@ -22,6 +22,13 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * Small localhost HTTP proxy used as a controlled bridge between WebView and ipfs.io.
+ *
+ * <p>The proxy serves only IPFS paths, forwards requests to the configured gateway,
+ * and rewrites selected response headers so Android WebView renders RPlayer assets
+ * instead of treating them as forced downloads.</p>
+ */
 final class GatewayProxyServer implements Closeable {
     private static final String LOG_TAG = "RPlayerProxy";
     private static final String GATEWAY_ORIGIN = "https://ipfs.io";
@@ -33,6 +40,12 @@ final class GatewayProxyServer implements Closeable {
     private volatile boolean running;
     private Thread acceptThread;
 
+    /**
+     * Starts the proxy on a random localhost port.
+     *
+     * @return the selected local TCP port
+     * @throws IOException when the local server socket cannot be opened
+     */
     int start() throws IOException {
         serverSocket = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
         running = true;
@@ -41,10 +54,18 @@ final class GatewayProxyServer implements Closeable {
         return serverSocket.getLocalPort();
     }
 
+    /**
+     * Builds the local URL loaded by the WebView for the fixed album entry point.
+     *
+     * @return local proxy URL for the configured RPlayer index file
+     */
     String viewerUrl() {
         return "http://127.0.0.1:" + serverSocket.getLocalPort() + ROOT_PATH;
     }
 
+    /**
+     * Stops accepting new proxy connections and shuts down worker threads.
+     */
     @Override
     public void close() {
         running = false;
@@ -52,6 +73,9 @@ final class GatewayProxyServer implements Closeable {
         executorService.shutdownNow();
     }
 
+    /**
+     * Accepts local WebView connections and dispatches each socket to a worker thread.
+     */
     private void acceptLoop() {
         while (running) {
             try {
@@ -59,12 +83,17 @@ final class GatewayProxyServer implements Closeable {
                 executorService.execute(() -> handleSocket(socket));
             } catch (IOException exception) {
                 if (running) {
-                    Log.w(LOG_TAG, "Proxy nemohl přijmout spojení.", exception);
+                    Log.w(LOG_TAG, "Proxy could not accept a connection.", exception);
                 }
             }
         }
     }
 
+    /**
+     * Handles one raw HTTP request from WebView and routes it through the proxy policy.
+     *
+     * @param socket accepted localhost socket from Android WebView
+     */
     private void handleSocket(Socket socket) {
         try {
             HttpRequest request = readRequest(socket);
@@ -76,28 +105,35 @@ final class GatewayProxyServer implements Closeable {
             Log.i(LOG_TAG, request.method + " " + request.path);
 
             if (!"GET".equals(request.method) && !"HEAD".equals(request.method)) {
-                writePlainResponse(socket, 405, "Method Not Allowed", "Metoda neni podporovana.");
+                writePlainResponse(socket, 405, "Method Not Allowed", "The method is not supported.");
                 return;
             }
 
             if (!request.path.startsWith("/ipfs/")) {
-                writePlainResponse(socket, 404, "Not Found", "Proxy obsluhuje pouze IPFS cestu RPlayeru.");
+                writePlainResponse(socket, 404, "Not Found", "The proxy only serves the RPlayer IPFS path.");
                 return;
             }
 
             proxyRequest(socket, request);
         } catch (IOException exception) {
-            Log.w(LOG_TAG, "Proxy pozadavek selhal.", exception);
+            Log.w(LOG_TAG, "Proxy request failed.", exception);
             try {
-                writePlainResponse(socket, 502, "Bad Gateway", "Proxy nedokazala nacist obsah z ipfs.io.");
+                writePlainResponse(socket, 502, "Bad Gateway", "The proxy could not load content from ipfs.io.");
             } catch (IOException responseException) {
-                Log.w(LOG_TAG, "Proxy nedokazala odeslat chybovou odpoved.", responseException);
+                Log.w(LOG_TAG, "The proxy could not send an error response.", responseException);
             }
         } finally {
             closeQuietly(socket);
         }
     }
 
+    /**
+     * Parses the minimal HTTP request data needed by this proxy.
+     *
+     * @param socket source socket with the WebView request
+     * @return parsed request, or null when the request line is empty or invalid
+     * @throws IOException when the socket stream cannot be read
+     */
     private HttpRequest readRequest(Socket socket) throws IOException {
         BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.ISO_8859_1));
         String requestLine = reader.readLine();
@@ -125,6 +161,13 @@ final class GatewayProxyServer implements Closeable {
         return new HttpRequest(requestParts[0], requestParts[1], headers);
     }
 
+    /**
+     * Forwards an allowed request to ipfs.io and streams the gateway response back.
+     *
+     * @param socket target socket connected to WebView
+     * @param request parsed request to forward
+     * @throws IOException when the gateway request or local response fails
+     */
     private void proxyRequest(Socket socket, HttpRequest request) throws IOException {
         URL gatewayUrl = new URL(GATEWAY_ORIGIN + request.path);
         HttpURLConnection connection = (HttpURLConnection) gatewayUrl.openConnection();
@@ -151,6 +194,20 @@ final class GatewayProxyServer implements Closeable {
         connection.disconnect();
     }
 
+    /**
+     * Writes the proxied HTTP response and replaces unsafe or unreliable headers.
+     *
+     * <p>The MIME type is resolved from the requested path first, because IPFS gateways
+     * may return headers that make WebView download assets instead of rendering them.</p>
+     *
+     * @param socket target socket connected to WebView
+     * @param request original local request
+     * @param connection open gateway connection
+     * @param statusCode gateway HTTP status code
+     * @param statusText gateway HTTP status message
+     * @param responseStream gateway response body stream
+     * @throws IOException when the response cannot be written
+     */
     private void writeGatewayResponse(
         Socket socket,
         HttpRequest request,
@@ -200,6 +257,15 @@ final class GatewayProxyServer implements Closeable {
         closeQuietly(responseStream);
     }
 
+    /**
+     * Writes a small local plain-text HTTP response for proxy policy errors.
+     *
+     * @param socket target socket connected to WebView
+     * @param statusCode HTTP status code to send
+     * @param statusText HTTP status text to send
+     * @param body response body text
+     * @throws IOException when the response cannot be written
+     */
     private void writePlainResponse(Socket socket, int statusCode, String statusText, String body) throws IOException {
         byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
         BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
@@ -212,10 +278,16 @@ final class GatewayProxyServer implements Closeable {
         outputStream.flush();
     }
 
+    /**
+     * Writes one HTTP header line using the wire encoding expected by HTTP/1.1.
+     */
     private static void writeHeader(BufferedOutputStream outputStream, String name, String value) throws IOException {
         outputStream.write((name + ": " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
     }
 
+    /**
+     * Copies the response body without buffering the whole file in memory.
+     */
     private static void copyStream(InputStream inputStream, BufferedOutputStream outputStream) throws IOException {
         BufferedInputStream bufferedInputStream = new BufferedInputStream(inputStream);
         byte[] buffer = new byte[BUFFER_SIZE];
@@ -226,6 +298,9 @@ final class GatewayProxyServer implements Closeable {
         }
     }
 
+    /**
+     * Returns a valid HTTP status text when the gateway omits the reason phrase.
+     */
     private static String safeStatusText(String statusText) {
         if (statusText == null || statusText.trim().isEmpty()) {
             return "OK";
@@ -234,6 +309,9 @@ final class GatewayProxyServer implements Closeable {
         return statusText;
     }
 
+    /**
+     * Closes a resource during cleanup without replacing the original proxy error.
+     */
     private static void closeQuietly(Closeable closeable) {
         if (closeable == null) {
             return;
@@ -245,6 +323,9 @@ final class GatewayProxyServer implements Closeable {
         }
     }
 
+    /**
+     * Minimal immutable representation of the HTTP request fields used by the proxy.
+     */
     private static final class HttpRequest {
         private final String method;
         private final String path;
@@ -256,6 +337,12 @@ final class GatewayProxyServer implements Closeable {
             this.headers = headers;
         }
 
+        /**
+         * Converts absolute localhost request targets to origin-form paths.
+         *
+         * <p>Most WebView requests already use paths such as /ipfs/..., but the proxy
+         * also accepts absolute localhost URLs defensively.</p>
+         */
         private static String normalizePath(String rawPath) {
             if (rawPath.startsWith("http://127.0.0.1")) {
                 int pathStart = rawPath.indexOf('/', "http://127.0.0.1".length());
