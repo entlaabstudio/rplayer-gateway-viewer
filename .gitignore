@@ -1,0 +1,24 @@
+# Local Gradle state and build outputs.
+/.gradle/
+/build/
+/app/build/
+
+# Local tool symlinks for this machine.
+/tools/
+
+# Local Android SDK settings.
+local.properties
+
+# Release artifacts are published through GitHub Releases/IPFS, not directly in the repository.
+*.apk
+*.ap_
+*.dex
+
+# IDE metadata.
+*.iml
+
+# The Gradle wrapper is a build input and belongs in the repository.
+!gradlew
+!gradlew.bat
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties

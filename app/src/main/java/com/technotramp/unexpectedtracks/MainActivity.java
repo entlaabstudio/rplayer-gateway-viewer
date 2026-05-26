@@ -1,0 +1,128 @@
+package com.technotramp.unexpectedtracks;
+
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public final class MainActivity extends Activity {
+    private static final String LOG_TAG = "RPlayerViewer";
+
+    private GatewayProxyServer proxyServer;
+    private WebView webView;
+    private TextView errorView;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        createLayout();
+
+        try {
+            proxyServer = new GatewayProxyServer();
+            proxyServer.start();
+            configureWebView();
+            webView.loadUrl(proxyServer.viewerUrl());
+        } catch (IOException exception) {
+            Log.e(LOG_TAG, "Proxy server could not be started.", exception);
+            showError("RPlayer Gateway Viewer could not start the local proxy.");
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (webView != null) {
+            webView.destroy();
+        }
+
+        if (proxyServer != null) {
+            proxyServer.close();
+        }
+
+        super.onDestroy();
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private void configureWebView() {
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setDatabaseEnabled(true);
+        settings.setLoadsImagesAutomatically(true);
+        settings.setSupportZoom(true);
+        settings.setBuiltInZoomControls(false);
+
+        webView.setWebChromeClient(new WebChromeClient());
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                String scheme = request.getUrl().getScheme();
+                String host = request.getUrl().getHost();
+                boolean internalRequest = "data".equals(scheme) || "about".equals(scheme) || "blob".equals(scheme);
+                boolean localRequest = "127.0.0.1".equals(host) || "localhost".equals(host);
+
+                if (internalRequest || localRequest) {
+                    return super.shouldInterceptRequest(view, request);
+                }
+
+                // The prototype does not allow external navigation outside the local proxy yet.
+                return blockedResponse();
+            }
+        });
+    }
+
+    private void createLayout() {
+        FrameLayout root = new FrameLayout(this);
+        webView = new WebView(this);
+        errorView = new TextView(this);
+
+        errorView.setTextColor(0xffffffff);
+        errorView.setBackgroundColor(0xff000000);
+        errorView.setTextSize(16);
+        errorView.setPadding(24, 24, 24, 24);
+        errorView.setVisibility(TextView.GONE);
+
+        root.addView(webView, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        root.addView(errorView, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        setContentView(root);
+    }
+
+    private void showError(String message) {
+        errorView.setText(message);
+        errorView.setVisibility(TextView.VISIBLE);
+    }
+
+    private WebResourceResponse blockedResponse() {
+        byte[] body = "External addresses are blocked in this prototype.".getBytes(StandardCharsets.UTF_8);
+        return new WebResourceResponse(
+            "text/plain",
+            "utf-8",
+            new ByteArrayInputStream(body)
+        );
+    }
+}
