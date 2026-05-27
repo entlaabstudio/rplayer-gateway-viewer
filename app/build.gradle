@@ -13,4 +13,10 @@ android {
         versionCode 1
         versionName "0.1.0"
     }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "unexpected-tracks-${variant.versionName}-${variant.name}.apk"
+        }
+    }
 }
