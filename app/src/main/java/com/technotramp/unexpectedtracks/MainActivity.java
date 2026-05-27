@@ -2,10 +2,15 @@ package com.technotramp.unexpectedtracks;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
+import android.util.Base64;
 import android.util.Log;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -16,7 +21,12 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import java.io.ByteArrayInputStream;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -27,10 +37,14 @@ import java.nio.charset.StandardCharsets;
  */
 public final class MainActivity extends Activity {
     private static final String LOG_TAG = "RPlayerViewer";
+    private static final int CREATE_DOWNLOAD_REQUEST_CODE = 1001;
+    private static final int COPY_BUFFER_SIZE = 32 * 1024;
 
     private GatewayProxyServer proxyServer;
     private WebView webView;
     private TextView errorView;
+    private DownloadSession activeDownloadSession;
+    private PendingDownload pendingDownload;
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -53,10 +67,47 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Releases WebView and proxy resources when the activity is destroyed.
+     * Handles the Android save dialog result for a generated RPlayer ZIP file.
+     */
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode != CREATE_DOWNLOAD_REQUEST_CODE) {
+            return;
+        }
+
+        PendingDownload download = pendingDownload;
+        pendingDownload = null;
+
+        if (download == null) {
+            return;
+        }
+
+        if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+            try {
+                copyDownloadToUri(download, data.getData());
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Generated ZIP could not be saved.", exception);
+                showError("RPlayer Gateway Viewer could not save the generated ZIP file.");
+            }
+        }
+
+        deleteTempFile(download.file);
+    }
+
+    /**
+     * Releases WebView, proxy, and temporary download resources when the activity is destroyed.
      */
     @Override
     protected void onDestroy() {
+        closeActiveDownloadSession();
+
+        if (pendingDownload != null) {
+            deleteTempFile(pendingDownload.file);
+            pendingDownload = null;
+        }
+
         if (webView != null) {
             webView.destroy();
         }
@@ -72,7 +123,7 @@ public final class MainActivity extends Activity {
      * Enables the WebView features required by RPlayer while keeping file and
      * content access disabled.
      */
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     private void configureWebView() {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -85,6 +136,7 @@ public final class MainActivity extends Activity {
         settings.setSupportZoom(true);
         settings.setBuiltInZoomControls(false);
 
+        webView.addJavascriptInterface(new DownloadBridge(), "RPlayerGatewayDownloads");
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -101,7 +153,78 @@ public final class MainActivity extends Activity {
                 // The prototype does not allow external navigation outside the local proxy yet.
                 return blockedResponse();
             }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                injectDownloadBridge();
+            }
         });
+    }
+
+    /**
+     * Injects the JavaScript hook that routes FileSaver-style Blob downloads to Android.
+     */
+    private void injectDownloadBridge() {
+        webView.evaluateJavascript(downloadBridgeScript(), null);
+    }
+
+    /**
+     * Builds the JavaScript hook that replaces saveAs(blob, filename) after FileSaver loads.
+     *
+     * <p>The script reads the Blob in chunks and sends Base64 chunks through the
+     * Android bridge, avoiding one huge JavaScript-to-Java call for the whole ZIP.</p>
+     *
+     * @return JavaScript source executed inside the WebView
+     */
+    private String downloadBridgeScript() {
+        return "(function installRPlayerGatewayDownloadBridge() {"
+            + "if (window.RPlayerGatewayViewerSaveAsHook) { return; }"
+            + "if (typeof window.saveAs !== 'function') {"
+            + "window.setTimeout(installRPlayerGatewayDownloadBridge, 500);"
+            + "return;"
+            + "}"
+            + "var originalSaveAs = window.saveAs;"
+            + "var chunkSize = 196608;"
+            + "function sendBlobToAndroid(blob, fileName) {"
+            + "var downloadId = String(Date.now()) + '-' + Math.random().toString(16).slice(2);"
+            + "var safeName = fileName || 'unexpected-tracks.zip';"
+            + "var mimeType = blob.type || 'application/zip';"
+            + "var offset = 0;"
+            + "var chunkIndex = 0;"
+            + "window.RPlayerGatewayDownloads.beginDownload(downloadId, safeName, mimeType, blob.size || 0);"
+            + "function readNextChunk() {"
+            + "if (offset >= blob.size) {"
+            + "window.RPlayerGatewayDownloads.finishDownload(downloadId);"
+            + "return;"
+            + "}"
+            + "var slice = blob.slice(offset, Math.min(offset + chunkSize, blob.size));"
+            + "var reader = new FileReader();"
+            + "reader.onload = function() {"
+            + "var result = String(reader.result || '');"
+            + "var commaIndex = result.indexOf(',');"
+            + "var base64 = commaIndex >= 0 ? result.substring(commaIndex + 1) : result;"
+            + "window.RPlayerGatewayDownloads.appendChunk(downloadId, chunkIndex, base64);"
+            + "offset += chunkSize;"
+            + "chunkIndex += 1;"
+            + "readNextChunk();"
+            + "};"
+            + "reader.onerror = function() {"
+            + "window.RPlayerGatewayDownloads.failDownload(downloadId, 'Could not read generated ZIP chunk.');"
+            + "};"
+            + "reader.readAsDataURL(slice);"
+            + "}"
+            + "readNextChunk();"
+            + "}"
+            + "window.saveAs = function(blob, fileName) {"
+            + "if (blob && typeof blob.slice === 'function' && window.RPlayerGatewayDownloads) {"
+            + "sendBlobToAndroid(blob, fileName);"
+            + "return;"
+            + "}"
+            + "return originalSaveAs.apply(this, arguments);"
+            + "};"
+            + "window.RPlayerGatewayViewerSaveAsHook = true;"
+            + "})();";
     }
 
     /**
@@ -132,7 +255,7 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Displays a startup error when the local proxy cannot be created.
+     * Displays a startup or download error above the WebView.
      */
     private void showError(String message) {
         errorView.setText(message);
@@ -149,5 +272,283 @@ public final class MainActivity extends Activity {
             "utf-8",
             new ByteArrayInputStream(body)
         );
+    }
+
+    /**
+     * Opens Android's system save dialog for a completed temporary ZIP file.
+     *
+     * @param download completed temporary download waiting for a user-selected destination
+     */
+    private void openSaveDialog(PendingDownload download) {
+        pendingDownload = download;
+
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType(download.mimeType);
+        intent.putExtra(Intent.EXTRA_TITLE, download.fileName);
+
+        try {
+            startActivityForResult(intent, CREATE_DOWNLOAD_REQUEST_CODE);
+        } catch (ActivityNotFoundException exception) {
+            Log.e(LOG_TAG, "Android save dialog is not available.", exception);
+            showError("Android save dialog is not available.");
+            pendingDownload = null;
+            deleteTempFile(download.file);
+        }
+    }
+
+    /**
+     * Copies a temporary generated ZIP to the document URI selected by the user.
+     *
+     * @param download completed temporary download to copy
+     * @param destinationUri Android document URI selected in the save dialog
+     * @throws IOException when the temporary file cannot be copied
+     */
+    private void copyDownloadToUri(PendingDownload download, Uri destinationUri) throws IOException {
+        try (
+            FileInputStream inputStream = new FileInputStream(download.file);
+            OutputStream outputStream = getContentResolver().openOutputStream(destinationUri)
+        ) {
+            if (outputStream == null) {
+                throw new IOException("Android returned no output stream for the selected destination.");
+            }
+
+            byte[] buffer = new byte[COPY_BUFFER_SIZE];
+            int read;
+            while ((read = inputStream.read(buffer)) >= 0) {
+                outputStream.write(buffer, 0, read);
+            }
+        }
+    }
+
+    /**
+     * Closes the current JavaScript download session and removes its temporary file.
+     */
+    private synchronized void closeActiveDownloadSession() {
+        if (activeDownloadSession == null) {
+            return;
+        }
+
+        closeQuietly(activeDownloadSession.outputStream);
+        deleteTempFile(activeDownloadSession.file);
+        activeDownloadSession = null;
+    }
+
+    /**
+     * Deletes a temporary file and logs a warning when Android keeps it locked.
+     *
+     * @param file temporary file to delete
+     */
+    private void deleteTempFile(File file) {
+        if (file != null && file.exists() && !file.delete()) {
+            Log.w(LOG_TAG, "Temporary download file could not be deleted: " + file.getAbsolutePath());
+        }
+    }
+
+    /**
+     * Closes a resource during cleanup without hiding the original error path.
+     *
+     * @param closeable resource to close
+     */
+    private static void closeQuietly(Closeable closeable) {
+        if (closeable == null) {
+            return;
+        }
+
+        try {
+            closeable.close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    /**
+     * Sanitizes a browser-supplied filename before it is shown in Android's save dialog.
+     *
+     * @param fileName filename received from RPlayer/FileSaver
+     * @return safe filename for ACTION_CREATE_DOCUMENT
+     */
+    private static String sanitizeFileName(String fileName) {
+        if (fileName == null) {
+            return "unexpected-tracks.zip";
+        }
+
+        String cleanName = fileName.trim().replace('"', '_').replaceAll("[\\\\/:*?<>|]", "_");
+        if (cleanName.isEmpty()) {
+            return "unexpected-tracks.zip";
+        }
+
+        return cleanName;
+    }
+
+    /**
+     * JavaScript interface that receives generated ZIP data from the WebView in chunks.
+     */
+    private final class DownloadBridge {
+        /**
+         * Starts a new temporary download file for a Blob generated inside WebView.
+         *
+         * @param downloadId JavaScript-generated identifier for this download
+         * @param fileName suggested filename from RPlayer/FileSaver
+         * @param mimeType Blob MIME type
+         * @param totalBytes expected byte size reported by Blob.size
+         */
+        @JavascriptInterface
+        public synchronized void beginDownload(String downloadId, String fileName, String mimeType, long totalBytes) {
+            closeActiveDownloadSession();
+
+            try {
+                File file = File.createTempFile("rplayer-download-", ".tmp", getCacheDir());
+                FileOutputStream outputStream = new FileOutputStream(file);
+                activeDownloadSession = new DownloadSession(
+                    downloadId,
+                    sanitizeFileName(fileName),
+                    mimeType == null || mimeType.trim().isEmpty() ? "application/zip" : mimeType,
+                    totalBytes,
+                    file,
+                    outputStream
+                );
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Temporary download file could not be created.", exception);
+                showDownloadError("RPlayer Gateway Viewer could not create a temporary download file.");
+            }
+        }
+
+        /**
+         * Appends one Base64-encoded Blob chunk to the active temporary file.
+         *
+         * @param downloadId JavaScript-generated identifier for this download
+         * @param chunkIndex zero-based chunk index used to detect ordering errors
+         * @param base64Chunk Base64-encoded chunk payload
+         */
+        @JavascriptInterface
+        public synchronized void appendChunk(String downloadId, int chunkIndex, String base64Chunk) {
+            if (!isActiveDownload(downloadId)) {
+                return;
+            }
+
+            if (chunkIndex != activeDownloadSession.nextChunkIndex) {
+                failDownload(downloadId, "Download chunks arrived out of order.");
+                return;
+            }
+
+            try {
+                byte[] data = Base64.decode(base64Chunk, Base64.NO_WRAP);
+                activeDownloadSession.outputStream.write(data);
+                activeDownloadSession.nextChunkIndex += 1;
+                activeDownloadSession.receivedBytes += data.length;
+            } catch (IOException | IllegalArgumentException exception) {
+                Log.e(LOG_TAG, "Generated ZIP chunk could not be written.", exception);
+                failDownload(downloadId, "Generated ZIP chunk could not be written.");
+            }
+        }
+
+        /**
+         * Finalizes the temporary file and opens Android's save dialog.
+         *
+         * @param downloadId JavaScript-generated identifier for this download
+         */
+        @JavascriptInterface
+        public synchronized void finishDownload(String downloadId) {
+            if (!isActiveDownload(downloadId)) {
+                return;
+            }
+
+            DownloadSession session = activeDownloadSession;
+            activeDownloadSession = null;
+
+            try {
+                session.outputStream.flush();
+                session.outputStream.close();
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Generated ZIP file could not be finalized.", exception);
+                deleteTempFile(session.file);
+                showDownloadError("RPlayer Gateway Viewer could not finalize the generated ZIP file.");
+                return;
+            }
+
+            PendingDownload download = new PendingDownload(session.fileName, session.mimeType, session.file);
+            runOnUiThread(() -> openSaveDialog(download));
+        }
+
+        /**
+         * Aborts the active temporary file after a JavaScript-side download failure.
+         *
+         * @param downloadId JavaScript-generated identifier for this download
+         * @param message readable failure reason from the WebView
+         */
+        @JavascriptInterface
+        public synchronized void failDownload(String downloadId, String message) {
+            if (!isActiveDownload(downloadId)) {
+                return;
+            }
+
+            Log.e(LOG_TAG, message == null ? "Generated ZIP download failed." : message);
+            closeActiveDownloadSession();
+            showDownloadError("RPlayer Gateway Viewer could not receive the generated ZIP file.");
+        }
+
+        /**
+         * Checks whether a JavaScript callback belongs to the current download session.
+         *
+         * @param downloadId JavaScript-generated identifier to validate
+         * @return true when the callback belongs to the active download
+         */
+        private boolean isActiveDownload(String downloadId) {
+            return activeDownloadSession != null && activeDownloadSession.downloadId.equals(downloadId);
+        }
+
+        /**
+         * Shows a download error from the UI thread.
+         *
+         * @param message message displayed over the WebView
+         */
+        private void showDownloadError(String message) {
+            runOnUiThread(() -> showError(message));
+        }
+    }
+
+    /**
+     * Mutable state for one in-progress Blob transfer from JavaScript to Android.
+     */
+    private static final class DownloadSession {
+        private final String downloadId;
+        private final String fileName;
+        private final String mimeType;
+        private final long totalBytes;
+        private final File file;
+        private final FileOutputStream outputStream;
+        private int nextChunkIndex;
+        private long receivedBytes;
+
+        private DownloadSession(
+            String downloadId,
+            String fileName,
+            String mimeType,
+            long totalBytes,
+            File file,
+            FileOutputStream outputStream
+        ) {
+            this.downloadId = downloadId;
+            this.fileName = fileName;
+            this.mimeType = mimeType;
+            this.totalBytes = totalBytes;
+            this.file = file;
+            this.outputStream = outputStream;
+        }
+    }
+
+    /**
+     * Completed temporary download waiting for the Android save dialog result.
+     */
+    private static final class PendingDownload {
+        private final String fileName;
+        private final String mimeType;
+        private final File file;
+
+        private PendingDownload(String fileName, String mimeType, File file) {
+            this.fileName = fileName;
+            this.mimeType = mimeType;
+            this.file = file;
+        }
     }
 }
