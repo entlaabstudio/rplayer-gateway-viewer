@@ -21,11 +21,13 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 
@@ -45,6 +47,7 @@ public final class MainActivity extends Activity {
     private TextView errorView;
     private DownloadSession activeDownloadSession;
     private PendingDownload pendingDownload;
+    private String downloadBridgeScriptSource;
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -166,65 +169,48 @@ public final class MainActivity extends Activity {
      * Injects the JavaScript hook that routes FileSaver-style Blob downloads to Android.
      */
     private void injectDownloadBridge() {
-        webView.evaluateJavascript(downloadBridgeScript(), null);
+        try {
+            webView.evaluateJavascript(downloadBridgeScript(), null);
+        } catch (IOException exception) {
+            Log.e(LOG_TAG, "Download bridge script could not be loaded.", exception);
+            showError("RPlayer Gateway Viewer could not load the download bridge.");
+        }
     }
 
     /**
-     * Builds the JavaScript hook that replaces saveAs(blob, filename) after FileSaver loads.
-     *
-     * <p>The script reads the Blob in chunks and sends Base64 chunks through the
-     * Android bridge, avoiding one huge JavaScript-to-Java call for the whole ZIP.</p>
+     * Loads the JavaScript bridge from Android assets and caches it for later page loads.
      *
      * @return JavaScript source executed inside the WebView
+     * @throws IOException when the asset cannot be read
      */
-    private String downloadBridgeScript() {
-        return "(function installRPlayerGatewayDownloadBridge() {"
-            + "if (window.RPlayerGatewayViewerSaveAsHook) { return; }"
-            + "if (typeof window.saveAs !== 'function') {"
-            + "window.setTimeout(installRPlayerGatewayDownloadBridge, 500);"
-            + "return;"
-            + "}"
-            + "var originalSaveAs = window.saveAs;"
-            + "var chunkSize = 196608;"
-            + "function sendBlobToAndroid(blob, fileName) {"
-            + "var downloadId = String(Date.now()) + '-' + Math.random().toString(16).slice(2);"
-            + "var safeName = fileName || 'unexpected-tracks.zip';"
-            + "var mimeType = blob.type || 'application/zip';"
-            + "var offset = 0;"
-            + "var chunkIndex = 0;"
-            + "window.RPlayerGatewayDownloads.beginDownload(downloadId, safeName, mimeType, blob.size || 0);"
-            + "function readNextChunk() {"
-            + "if (offset >= blob.size) {"
-            + "window.RPlayerGatewayDownloads.finishDownload(downloadId);"
-            + "return;"
-            + "}"
-            + "var slice = blob.slice(offset, Math.min(offset + chunkSize, blob.size));"
-            + "var reader = new FileReader();"
-            + "reader.onload = function() {"
-            + "var result = String(reader.result || '');"
-            + "var commaIndex = result.indexOf(',');"
-            + "var base64 = commaIndex >= 0 ? result.substring(commaIndex + 1) : result;"
-            + "window.RPlayerGatewayDownloads.appendChunk(downloadId, chunkIndex, base64);"
-            + "offset += chunkSize;"
-            + "chunkIndex += 1;"
-            + "readNextChunk();"
-            + "};"
-            + "reader.onerror = function() {"
-            + "window.RPlayerGatewayDownloads.failDownload(downloadId, 'Could not read generated ZIP chunk.');"
-            + "};"
-            + "reader.readAsDataURL(slice);"
-            + "}"
-            + "readNextChunk();"
-            + "}"
-            + "window.saveAs = function(blob, fileName) {"
-            + "if (blob && typeof blob.slice === 'function' && window.RPlayerGatewayDownloads) {"
-            + "sendBlobToAndroid(blob, fileName);"
-            + "return;"
-            + "}"
-            + "return originalSaveAs.apply(this, arguments);"
-            + "};"
-            + "window.RPlayerGatewayViewerSaveAsHook = true;"
-            + "})();";
+    private String downloadBridgeScript() throws IOException {
+        if (downloadBridgeScriptSource == null) {
+            downloadBridgeScriptSource = readAssetText("download-bridge.js");
+        }
+
+        return downloadBridgeScriptSource;
+    }
+
+    /**
+     * Reads a UTF-8 text asset bundled with the application.
+     *
+     * @param assetName asset filename relative to app/src/main/assets
+     * @return complete asset text
+     * @throws IOException when the asset cannot be opened or read
+     */
+    private String readAssetText(String assetName) throws IOException {
+        try (
+            InputStream inputStream = getAssets().open(assetName);
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream()
+        ) {
+            byte[] buffer = new byte[COPY_BUFFER_SIZE];
+            int read;
+            while ((read = inputStream.read(buffer)) >= 0) {
+                outputStream.write(buffer, 0, read);
+            }
+
+            return outputStream.toString(StandardCharsets.UTF_8.name());
+        }
     }
 
     /**
