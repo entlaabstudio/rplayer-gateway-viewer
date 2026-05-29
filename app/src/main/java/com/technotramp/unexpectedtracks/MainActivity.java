@@ -56,6 +56,12 @@ public final class MainActivity extends Activity {
     private static final String DEFAULT_MEDIA_TITLE = "Unexpected Tracks";
     private static final String DEFAULT_MEDIA_ARTIST = "Technotramp";
     private static final String DEFAULT_MEDIA_ALBUM = "Unexpected Tracks";
+    private static final String ACTION_MEDIA_PREVIOUS = "com.technotramp.unexpectedtracks.action.MEDIA_PREVIOUS";
+    private static final String ACTION_MEDIA_PLAY_PAUSE = "com.technotramp.unexpectedtracks.action.MEDIA_PLAY_PAUSE";
+    private static final String ACTION_MEDIA_NEXT = "com.technotramp.unexpectedtracks.action.MEDIA_NEXT";
+    private static final int MEDIA_PREVIOUS_REQUEST_CODE = 2002;
+    private static final int MEDIA_PLAY_PAUSE_REQUEST_CODE = 2003;
+    private static final int MEDIA_NEXT_REQUEST_CODE = 2004;
     private static final long MEDIA_SESSION_ACTIONS = PlaybackState.ACTION_PLAY
         | PlaybackState.ACTION_PAUSE
         | PlaybackState.ACTION_PLAY_PAUSE
@@ -90,6 +96,8 @@ public final class MainActivity extends Activity {
         createMediaNotificationChannel();
         createMediaSession();
 
+        handleMediaControlIntent(getIntent());
+
         try {
             proxyServer = new GatewayProxyServer(mediaSessionBridgeScript(), new File(getFilesDir(), "rplayer-ipfs-cache"));
             proxyServer.start();
@@ -99,6 +107,18 @@ public final class MainActivity extends Activity {
             Log.e(LOG_TAG, "Proxy server could not be started.", exception);
             showError("RPlayer Gateway Viewer could not start the local proxy.");
         }
+    }
+
+    /**
+     * Handles media control intents delivered to an already running Activity.
+     *
+     * @param intent intent received from Android system UI
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleMediaControlIntent(intent);
     }
 
     /**
@@ -237,6 +257,47 @@ public final class MainActivity extends Activity {
                 injectMediaSessionBridge();
             }
         });
+    }
+
+    /**
+     * Dispatches media actions received from Android notification buttons.
+     *
+     * @param intent Android intent received by the Activity
+     */
+    private void handleMediaControlIntent(Intent intent) {
+        if (intent == null || intent.getAction() == null) {
+            return;
+        }
+
+        String action = intent.getAction();
+        if (ACTION_MEDIA_PREVIOUS.equals(action)) {
+            Log.i(LOG_TAG, "Media notification action: previous");
+            dispatchBrowserMediaAction("previoustrack");
+            return;
+        }
+
+        if (ACTION_MEDIA_PLAY_PAUSE.equals(action)) {
+            Log.i(LOG_TAG, "Media notification action: play/pause");
+            dispatchPlayPauseMediaAction();
+            return;
+        }
+
+        if (ACTION_MEDIA_NEXT.equals(action)) {
+            Log.i(LOG_TAG, "Media notification action: next");
+            dispatchBrowserMediaAction("nexttrack");
+        }
+    }
+
+    /**
+     * Sends a play or pause action based on the last known Android playback state.
+     */
+    private void dispatchPlayPauseMediaAction() {
+        if (currentPlaybackState == PlaybackState.STATE_PLAYING) {
+            dispatchBrowserMediaAction("pause");
+            return;
+        }
+
+        dispatchBrowserMediaAction("play");
     }
 
     /**
@@ -492,6 +553,10 @@ public final class MainActivity extends Activity {
             return;
         }
 
+        Notification.MediaStyle mediaStyle = new Notification.MediaStyle()
+            .setMediaSession(mediaSession.getSessionToken())
+            .setShowActionsInCompactView(0, 1, 2);
+
         Notification.Builder builder = notificationBuilder()
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(currentMediaTitle)
@@ -503,13 +568,62 @@ public final class MainActivity extends Activity {
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .setOngoing(currentPlaybackState == PlaybackState.STATE_PLAYING)
-            .setStyle(new Notification.MediaStyle().setMediaSession(mediaSession.getSessionToken()));
+            .addAction(android.R.drawable.ic_media_previous, "Previous", createMediaActionIntent(ACTION_MEDIA_PREVIOUS, MEDIA_PREVIOUS_REQUEST_CODE))
+            .addAction(playPauseIcon(), playPauseTitle(), createMediaActionIntent(ACTION_MEDIA_PLAY_PAUSE, MEDIA_PLAY_PAUSE_REQUEST_CODE))
+            .addAction(android.R.drawable.ic_media_next, "Next", createMediaActionIntent(ACTION_MEDIA_NEXT, MEDIA_NEXT_REQUEST_CODE))
+            .setStyle(mediaStyle);
 
         NotificationManager notificationManager = notificationManager();
         if (notificationManager != null) {
             notificationManager.notify(MEDIA_NOTIFICATION_ID, builder.build());
             Log.i(LOG_TAG, "Media notification updated: " + currentMediaTitle + ", state=" + currentPlaybackState);
         }
+    }
+
+    /**
+     * Creates a PendingIntent used by Android media notification actions.
+     *
+     * @param action internal action name handled by this Activity
+     * @param requestCode stable request code for the action button
+     * @return pending intent routed back to this Activity
+     */
+    private PendingIntent createMediaActionIntent(String action, int requestCode) {
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setAction(action);
+        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
+        return PendingIntent.getActivity(
+            this,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+    }
+
+    /**
+     * Returns the play/pause icon matching the current playback state.
+     *
+     * @return Android drawable resource ID
+     */
+    private int playPauseIcon() {
+        if (currentPlaybackState == PlaybackState.STATE_PLAYING) {
+            return android.R.drawable.ic_media_pause;
+        }
+
+        return android.R.drawable.ic_media_play;
+    }
+
+    /**
+     * Returns the play/pause action title matching the current playback state.
+     *
+     * @return action title shown by Android system UI
+     */
+    private String playPauseTitle() {
+        if (currentPlaybackState == PlaybackState.STATE_PLAYING) {
+            return "Pause";
+        }
+
+        return "Play";
     }
 
     /**
