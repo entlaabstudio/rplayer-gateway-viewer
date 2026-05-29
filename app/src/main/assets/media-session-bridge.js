@@ -110,27 +110,15 @@
      * @return {HTMLInputElement|null} RPlayer seeker input or null when it is unavailable.
      */
     function findTrackSeeker(targetWindow) {
-        var inputs = targetWindow.document.querySelectorAll('input[type="range"]');
-
-        for (var index = 0; index < inputs.length; index += 1) {
-            var input = inputs[index];
-            var min = Number(input.min || 0);
-            var max = Number(input.max || 0);
-            var value = Number(input.value || 0);
-
-            if (Number.isFinite(min)
-                && Number.isFinite(max)
-                && Number.isFinite(value)
-                && max > min
-                && (max - min) < 86400
-                && value >= min
-                && value <= max
-            ) {
-                return input;
-            }
+        var cachedSeeker = targetWindow.RPlayerGatewayViewerTrackSeeker;
+        if (cachedSeeker && targetWindow.document.contains(cachedSeeker)) {
+            return cachedSeeker;
         }
 
-        return null;
+        var seeker = targetWindow.document.querySelector('input.rplayerSeeker[type="range"]');
+        targetWindow.RPlayerGatewayViewerTrackSeeker = seeker;
+
+        return seeker;
     }
 
     /**
