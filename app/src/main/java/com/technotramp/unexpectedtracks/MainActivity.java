@@ -4,6 +4,10 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.media.MediaMetadata;
+import android.media.session.MediaSession;
+import android.media.session.PlaybackState;
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.Base64;
@@ -12,6 +16,7 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
@@ -41,13 +46,24 @@ public final class MainActivity extends Activity {
     private static final String LOG_TAG = "RPlayerViewer";
     private static final int CREATE_DOWNLOAD_REQUEST_CODE = 1001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
+    private static final long MEDIA_SESSION_ACTIONS = PlaybackState.ACTION_PLAY
+        | PlaybackState.ACTION_PAUSE
+        | PlaybackState.ACTION_PLAY_PAUSE
+        | PlaybackState.ACTION_SKIP_TO_NEXT
+        | PlaybackState.ACTION_SKIP_TO_PREVIOUS
+        | PlaybackState.ACTION_STOP
+        | PlaybackState.ACTION_SEEK_TO
+        | PlaybackState.ACTION_FAST_FORWARD
+        | PlaybackState.ACTION_REWIND;
 
     private GatewayProxyServer proxyServer;
     private WebView webView;
     private TextView errorView;
     private DownloadSession activeDownloadSession;
     private PendingDownload pendingDownload;
+    private MediaSession mediaSession;
     private String downloadBridgeScriptSource;
+    private String mediaSessionBridgeScriptSource;
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -57,9 +73,10 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         createLayout();
+        createMediaSession();
 
         try {
-            proxyServer = new GatewayProxyServer();
+            proxyServer = new GatewayProxyServer(mediaSessionBridgeScript());
             proxyServer.start();
             configureWebView();
             webView.loadUrl(proxyServer.viewerUrl());
@@ -111,6 +128,11 @@ public final class MainActivity extends Activity {
             pendingDownload = null;
         }
 
+        if (mediaSession != null) {
+            mediaSession.release();
+            mediaSession = null;
+        }
+
         if (webView != null) {
             webView.destroy();
         }
@@ -135,11 +157,13 @@ public final class MainActivity extends Activity {
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(false);
         settings.setDatabaseEnabled(true);
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         settings.setLoadsImagesAutomatically(true);
         settings.setSupportZoom(true);
         settings.setBuiltInZoomControls(false);
 
         webView.addJavascriptInterface(new DownloadBridge(), "RPlayerGatewayDownloads");
+        webView.addJavascriptInterface(new MediaSessionBridge(), "RPlayerGatewayMediaSessionNative");
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -158,11 +182,97 @@ public final class MainActivity extends Activity {
             }
 
             @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                super.onReceivedError(view, request, error);
+                Log.w(
+                    LOG_TAG,
+                    "WebView resource error: "
+                        + error.getErrorCode()
+                        + " " + error.getDescription()
+                        + ", url=" + request.getUrl()
+                        + ", mainFrame=" + request.isForMainFrame()
+                );
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
+                super.onReceivedHttpError(view, request, errorResponse);
+                Log.w(
+                    LOG_TAG,
+                    "WebView HTTP error: "
+                        + errorResponse.getStatusCode()
+                        + " " + errorResponse.getReasonPhrase()
+                        + ", url=" + request.getUrl()
+                        + ", mainFrame=" + request.isForMainFrame()
+                );
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                Log.i(LOG_TAG, "WebView page started: " + url);
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
+                Log.i(LOG_TAG, "WebView page finished: " + url);
                 injectDownloadBridge();
+                injectMediaSessionBridge();
             }
         });
+    }
+
+    /**
+     * Creates the native Android MediaSession used by OS-level media controls.
+     */
+    private void createMediaSession() {
+        mediaSession = new MediaSession(this, "RPlayerGatewayViewer");
+        mediaSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
+        mediaSession.setCallback(new MediaSession.Callback() {
+            @Override
+            public void onPlay() {
+                dispatchBrowserMediaAction("play");
+            }
+
+            @Override
+            public void onPause() {
+                dispatchBrowserMediaAction("pause");
+            }
+
+            @Override
+            public void onSkipToNext() {
+                dispatchBrowserMediaAction("nexttrack");
+            }
+
+            @Override
+            public void onSkipToPrevious() {
+                dispatchBrowserMediaAction("previoustrack");
+            }
+
+            @Override
+            public void onStop() {
+                dispatchBrowserMediaAction("stop");
+            }
+
+            @Override
+            public void onFastForward() {
+                dispatchBrowserMediaAction("seekforward");
+            }
+
+            @Override
+            public void onRewind() {
+                dispatchBrowserMediaAction("seekbackward");
+            }
+
+            @Override
+            public void onSeekTo(long position) {
+                String detailsJson = "{\"seekTime\":" + (position / 1000.0d) + "}";
+                dispatchBrowserMediaAction("seekto", detailsJson);
+            }
+        });
+        updateNativePlaybackState("none");
+        mediaSession.setActive(true);
     }
 
     /**
@@ -211,6 +321,135 @@ public final class MainActivity extends Activity {
 
             return outputStream.toString(StandardCharsets.UTF_8.name());
         }
+    }
+
+    /**
+     * Injects the JavaScript bridge that mirrors browser Media Session data to Android.
+     */
+    private void injectMediaSessionBridge() {
+        try {
+            webView.evaluateJavascript(mediaSessionBridgeScript(), null);
+        } catch (IOException exception) {
+            Log.e(LOG_TAG, "Media session bridge script could not be loaded.", exception);
+        }
+    }
+
+    /**
+     * Loads the Media Session JavaScript bridge from Android assets.
+     *
+     * @return JavaScript source executed inside the WebView
+     * @throws IOException when the asset cannot be read
+     */
+    private String mediaSessionBridgeScript() throws IOException {
+        if (mediaSessionBridgeScriptSource == null) {
+            mediaSessionBridgeScriptSource = readAssetText("media-session-bridge.js");
+        }
+
+        return mediaSessionBridgeScriptSource;
+    }
+
+    /**
+     * Sends an Android media action back to the browser Media Session handler.
+     *
+     * @param action browser Media Session action name
+     */
+    private void dispatchBrowserMediaAction(String action) {
+        dispatchBrowserMediaAction(action, "{}");
+    }
+
+    /**
+     * Sends an Android media action and detail object back to RPlayer.
+     *
+     * @param action browser Media Session action name
+     * @param detailsJson JavaScript object literal with action details
+     */
+    private void dispatchBrowserMediaAction(String action, String detailsJson) {
+        if (webView == null) {
+            return;
+        }
+
+        String script = "window.RPlayerGatewayMediaSession && "
+            + "window.RPlayerGatewayMediaSession.dispatchAction("
+            + jsString(action)
+            + ","
+            + detailsJson
+            + ");";
+        runOnUiThread(() -> webView.evaluateJavascript(script, null));
+    }
+
+    /**
+     * Updates Android's native MediaSession metadata.
+     *
+     * @param title current track title
+     * @param artist album artist or composer
+     * @param album album name
+     */
+    private void updateNativeMetadata(String title, String artist, String album) {
+        if (mediaSession == null) {
+            return;
+        }
+
+        MediaMetadata metadata = new MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
+            .build();
+        mediaSession.setMetadata(metadata);
+        mediaSession.setActive(true);
+    }
+
+    /**
+     * Updates Android's native MediaSession playback state.
+     *
+     * @param state browser Media Session playback state
+     */
+    private void updateNativePlaybackState(String state) {
+        if (mediaSession == null) {
+            return;
+        }
+
+        PlaybackState playbackState = new PlaybackState.Builder()
+            .setActions(MEDIA_SESSION_ACTIONS)
+            .setState(playbackStateFromWeb(state), PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+            .build();
+        mediaSession.setPlaybackState(playbackState);
+    }
+
+    /**
+     * Converts browser playback state names to Android playback state constants.
+     *
+     * @param state browser Media Session playback state
+     * @return Android PlaybackState constant
+     */
+    private static int playbackStateFromWeb(String state) {
+        if ("playing".equals(state)) {
+            return PlaybackState.STATE_PLAYING;
+        }
+
+        if ("paused".equals(state)) {
+            return PlaybackState.STATE_PAUSED;
+        }
+
+        return PlaybackState.STATE_NONE;
+    }
+
+    /**
+     * Escapes a Java string for single-quoted JavaScript string literals.
+     *
+     * @param value string to escape
+     * @return single-quoted JavaScript string literal
+     */
+    private static String jsString(String value) {
+        if (value == null) {
+            return "''";
+        }
+
+        return "'" + value
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            + "'";
     }
 
     /**
@@ -364,6 +603,56 @@ public final class MainActivity extends Activity {
         }
 
         return cleanName;
+    }
+
+    /**
+     * JavaScript interface that mirrors browser Media Session state to Android.
+     */
+    private final class MediaSessionBridge {
+        /**
+         * Receives metadata assigned by RPlayer through navigator.mediaSession.metadata.
+         *
+         * @param title current track title
+         * @param artist album artist or composer
+         * @param album album name
+         * @param artworkUrl first artwork URL reported by the browser Media Session API
+         */
+        @JavascriptInterface
+        public void updateMetadata(String title, String artist, String album, String artworkUrl) {
+            Log.i(LOG_TAG, "Media metadata: " + title + " / " + artist + " / " + album);
+            runOnUiThread(() -> updateNativeMetadata(title, artist, album));
+        }
+
+        /**
+         * Receives browser playback state changes observed in WebView.
+         *
+         * @param state browser Media Session playback state
+         */
+        @JavascriptInterface
+        public void updatePlaybackState(String state) {
+            Log.i(LOG_TAG, "Media playback state: " + state);
+            runOnUiThread(() -> updateNativePlaybackState(state));
+        }
+
+        /**
+         * Records that RPlayer registered a browser Media Session action handler.
+         *
+         * @param action browser Media Session action name
+         */
+        @JavascriptInterface
+        public void registerAction(String action) {
+            Log.i(LOG_TAG, "Media action registered: " + action);
+        }
+
+        /**
+         * Receives diagnostic messages from the JavaScript bridge.
+         *
+         * @param message diagnostic message
+         */
+        @JavascriptInterface
+        public void log(String message) {
+            Log.i(LOG_TAG, "Media bridge: " + message);
+        }
     }
 
     /**
