@@ -76,7 +76,7 @@ public final class MainActivity extends Activity {
         createMediaSession();
 
         try {
-            proxyServer = new GatewayProxyServer(mediaSessionBridgeScript());
+            proxyServer = new GatewayProxyServer(mediaSessionBridgeScript(), new File(getFilesDir(), "rplayer-ipfs-cache"));
             proxyServer.start();
             configureWebView();
             webView.loadUrl(proxyServer.viewerUrl());
