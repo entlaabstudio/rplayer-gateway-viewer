@@ -9,6 +9,7 @@ import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -39,6 +40,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -83,6 +86,8 @@ public final class MainActivity extends Activity {
     private String currentMediaTitle = DEFAULT_MEDIA_TITLE;
     private String currentMediaArtist = DEFAULT_MEDIA_ARTIST;
     private String currentMediaAlbum = DEFAULT_MEDIA_ALBUM;
+    private String currentMediaArtworkUrl = "";
+    private Bitmap currentMediaArtwork;
     private int currentPlaybackState = PlaybackState.STATE_NONE;
 
     /**
@@ -501,8 +506,9 @@ public final class MainActivity extends Activity {
      * @param title current track title
      * @param artist album artist or composer
      * @param album album name
+     * @param artworkUrl artwork URL resolved inside the WebView
      */
-    private void updateNativeMetadata(String title, String artist, String album) {
+    private void updateNativeMetadata(String title, String artist, String album, String artworkUrl) {
         if (mediaSession == null) {
             return;
         }
@@ -510,15 +516,116 @@ public final class MainActivity extends Activity {
         currentMediaTitle = mediaTextOrDefault(title, DEFAULT_MEDIA_TITLE);
         currentMediaArtist = mediaTextOrDefault(artist, DEFAULT_MEDIA_ARTIST);
         currentMediaAlbum = mediaTextOrDefault(album, DEFAULT_MEDIA_ALBUM);
-
-        MediaMetadata metadata = new MediaMetadata.Builder()
-            .putString(MediaMetadata.METADATA_KEY_TITLE, currentMediaTitle)
-            .putString(MediaMetadata.METADATA_KEY_ARTIST, currentMediaArtist)
-            .putString(MediaMetadata.METADATA_KEY_ALBUM, currentMediaAlbum)
-            .build();
-        mediaSession.setMetadata(metadata);
+        updateCurrentArtworkUrl(artworkUrl);
+        applyNativeMediaMetadata();
         mediaSession.setActive(true);
         updateMediaNotification();
+        loadArtworkAsync(currentMediaArtworkUrl);
+    }
+
+    /**
+     * Applies the latest known metadata values to Android's native MediaSession.
+     */
+    private void applyNativeMediaMetadata() {
+        if (mediaSession == null) {
+            return;
+        }
+
+        MediaMetadata.Builder builder = new MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, currentMediaTitle)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, currentMediaArtist)
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, currentMediaAlbum);
+
+        if (currentMediaArtwork != null) {
+            builder.putBitmap(MediaMetadata.METADATA_KEY_ART, currentMediaArtwork);
+            builder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, currentMediaArtwork);
+        }
+
+        mediaSession.setMetadata(builder.build());
+    }
+
+    /**
+     * Stores a new artwork URL and clears stale artwork when the track changes.
+     *
+     * @param artworkUrl artwork URL resolved inside the WebView
+     */
+    private void updateCurrentArtworkUrl(String artworkUrl) {
+        String normalizedArtworkUrl = mediaTextOrDefault(artworkUrl, "");
+
+        if (normalizedArtworkUrl.equals(currentMediaArtworkUrl)) {
+            return;
+        }
+
+        currentMediaArtworkUrl = normalizedArtworkUrl;
+        currentMediaArtwork = null;
+    }
+
+    /**
+     * Loads track artwork from the local proxy without blocking the UI thread.
+     *
+     * @param artworkUrl artwork URL resolved inside the WebView
+     */
+    private void loadArtworkAsync(String artworkUrl) {
+        if (!isLocalArtworkUrl(artworkUrl)) {
+            return;
+        }
+
+        Thread artworkThread = new Thread(() -> {
+            Bitmap bitmap = loadArtworkBitmap(artworkUrl);
+            if (bitmap == null) {
+                return;
+            }
+
+            runOnUiThread(() -> {
+                if (!artworkUrl.equals(currentMediaArtworkUrl)) {
+                    return;
+                }
+
+                currentMediaArtwork = bitmap;
+                applyNativeMediaMetadata();
+                updateMediaNotification();
+                Log.i(LOG_TAG, "Media artwork updated: " + artworkUrl);
+            });
+        }, "RPlayerArtworkLoader");
+        artworkThread.start();
+    }
+
+    /**
+     * Loads and decodes one artwork bitmap.
+     *
+     * @param artworkUrl local proxy artwork URL
+     * @return decoded bitmap or null when loading fails
+     */
+    private Bitmap loadArtworkBitmap(String artworkUrl) {
+        HttpURLConnection connection = null;
+
+        try {
+            connection = (HttpURLConnection) new URL(artworkUrl).openConnection();
+            connection.setConnectTimeout(5000);
+            connection.setReadTimeout(10000);
+
+            try (InputStream inputStream = connection.getInputStream()) {
+                return BitmapFactory.decodeStream(inputStream);
+            }
+        } catch (IOException exception) {
+            Log.w(LOG_TAG, "Media artwork could not be loaded: " + artworkUrl, exception);
+            return null;
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /**
+     * Checks whether artwork can be loaded through the local proxy.
+     *
+     * @param artworkUrl artwork URL resolved inside the WebView
+     * @return true when the URL points to the local proxy
+     */
+    private static boolean isLocalArtworkUrl(String artworkUrl) {
+        return artworkUrl != null
+            && (artworkUrl.startsWith("http://127.0.0.1:") || artworkUrl.startsWith("http://localhost:"));
     }
 
     /**
@@ -572,6 +679,10 @@ public final class MainActivity extends Activity {
             .addAction(playPauseIcon(), playPauseTitle(), createMediaActionIntent(ACTION_MEDIA_PLAY_PAUSE, MEDIA_PLAY_PAUSE_REQUEST_CODE))
             .addAction(android.R.drawable.ic_media_next, "Next", createMediaActionIntent(ACTION_MEDIA_NEXT, MEDIA_NEXT_REQUEST_CODE))
             .setStyle(mediaStyle);
+
+        if (currentMediaArtwork != null) {
+            builder.setLargeIcon(currentMediaArtwork);
+        }
 
         NotificationManager notificationManager = notificationManager();
         if (notificationManager != null) {
@@ -877,8 +988,8 @@ public final class MainActivity extends Activity {
          */
         @JavascriptInterface
         public void updateMetadata(String title, String artist, String album, String artworkUrl) {
-            Log.i(LOG_TAG, "Media metadata: " + title + " / " + artist + " / " + album);
-            runOnUiThread(() -> updateNativeMetadata(title, artist, album));
+            Log.i(LOG_TAG, "Media metadata: " + title + " / " + artist + " / " + album + " / " + artworkUrl);
+            runOnUiThread(() -> updateNativeMetadata(title, artist, album, artworkUrl));
         }
 
         /**

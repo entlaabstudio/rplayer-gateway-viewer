@@ -38,6 +38,25 @@
     rootWindow.RPlayerGatewayMediaSessionState = state;
 
     /**
+     * Converts an artwork URL from RPlayer metadata to an absolute URL.
+     *
+     * @param {string} artworkUrl Artwork URL from browser Media Session metadata.
+     * @return {string} Absolute artwork URL or the original value when it cannot be resolved.
+     */
+    function resolveArtworkUrl(artworkUrl) {
+        if (!artworkUrl) {
+            return '';
+        }
+
+        try {
+            return new URL(artworkUrl, rootWindow.location.href).href;
+        } catch (error) {
+            debugLog('Could not resolve artwork URL: ' + error.message);
+            return artworkUrl;
+        }
+    }
+
+    /**
      * Sends metadata from RPlayer's Media Session API to Android.
      *
      * @param {*} metadata MediaMetadata-like object provided by RPlayer.
@@ -53,7 +72,7 @@
         var title = String(metadata.title || '');
         var artist = String(metadata.artist || '');
         var album = String(metadata.album || '');
-        var artworkUrl = String(artwork || '');
+        var artworkUrl = resolveArtworkUrl(String(artwork || ''));
         var signature = JSON.stringify([title, artist, album, artworkUrl]);
 
         if (signature === state.lastMetadataSignature) {
