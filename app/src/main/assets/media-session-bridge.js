@@ -32,7 +32,9 @@
         actionHandlers: {},
         installedWindows: [],
         lastMetadataSignature: '',
-        lastPlaybackState: ''
+        lastPlaybackState: '',
+        lastProgressSignature: '',
+        lastSeekerStartSeconds: 0
     };
 
     rootWindow.RPlayerGatewayMediaSessionState = state;
@@ -102,6 +104,94 @@
     }
 
     /**
+     * Finds the RPlayer track seeker in a target window.
+     *
+     * @param {Window} targetWindow Window object to inspect.
+     * @return {HTMLInputElement|null} RPlayer seeker input or null when it is unavailable.
+     */
+    function findTrackSeeker(targetWindow) {
+        var inputs = targetWindow.document.querySelectorAll('input[type="range"]');
+
+        for (var index = 0; index < inputs.length; index += 1) {
+            var input = inputs[index];
+            var min = Number(input.min || 0);
+            var max = Number(input.max || 0);
+            var value = Number(input.value || 0);
+
+            if (Number.isFinite(min)
+                && Number.isFinite(max)
+                && Number.isFinite(value)
+                && max > min
+                && (max - min) < 86400
+                && value >= min
+                && value <= max
+            ) {
+                return input;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Sends the local RPlayer track progress to Android.
+     *
+     * @param {Window} targetWindow Window object containing RPlayer UI.
+     */
+    function sendProgressToAndroid(targetWindow) {
+        if (!nativeBridge || typeof nativeBridge.updateProgress !== 'function') {
+            return;
+        }
+
+        var seeker = findTrackSeeker(targetWindow);
+        if (!seeker) {
+            return;
+        }
+
+        var startSeconds = Number(seeker.min || 0);
+        var endSeconds = Number(seeker.max || 0);
+        var valueSeconds = Number(seeker.value || 0);
+        var durationSeconds = Math.max(0, endSeconds - startSeconds);
+        var positionSeconds = Math.max(0, Math.min(durationSeconds, valueSeconds - startSeconds));
+
+        if (!Number.isFinite(positionSeconds) || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+            return;
+        }
+
+        state.lastSeekerStartSeconds = startSeconds;
+
+        var positionMs = Math.round(positionSeconds * 1000);
+        var durationMs = Math.round(durationSeconds * 1000);
+        var signature = Math.round(positionSeconds) + '/' + Math.round(durationSeconds);
+
+        if (signature === state.lastProgressSignature) {
+            return;
+        }
+
+        state.lastProgressSignature = signature;
+        nativeBridge.updateProgress(positionMs, durationMs);
+    }
+
+    /**
+     * Converts local Android track seek details to RPlayer's absolute album timeline.
+     *
+     * @param {string} action Browser Media Session action name.
+     * @param {Object=} details Optional action details.
+     * @return {Object} Details object safe to pass to RPlayer.
+     */
+    function normalizeActionDetails(action, details) {
+        var normalizedDetails = details || {};
+
+        if (action === 'seekto' && typeof normalizedDetails.seekTime === 'number') {
+            normalizedDetails = Object.assign({}, normalizedDetails, {
+                seekTime: state.lastSeekerStartSeconds + normalizedDetails.seekTime
+            });
+        }
+
+        return normalizedDetails;
+    }
+
+    /**
      * Dispatches a native Android media action back to RPlayer's handler.
      *
      * @param {string} action Browser Media Session action name.
@@ -116,7 +206,7 @@
         }
 
         debugLog('Dispatching action to RPlayer: ' + action);
-        handler(details || {});
+        handler(normalizeActionDetails(action, details));
     }
 
     /**
@@ -254,6 +344,8 @@
                 if (browserPlaybackState && browserPlaybackState !== 'none') {
                     sendPlaybackStateToAndroid(browserPlaybackState);
                 }
+
+                sendProgressToAndroid(targetWindow);
             }
         }, 500);
 

@@ -88,6 +88,8 @@ public final class MainActivity extends Activity {
     private String currentMediaAlbum = DEFAULT_MEDIA_ALBUM;
     private String currentMediaArtworkUrl = "";
     private Bitmap currentMediaArtwork;
+    private long currentMediaPositionMs = PlaybackState.PLAYBACK_POSITION_UNKNOWN;
+    private long currentMediaDurationMs = -1;
     private int currentPlaybackState = PlaybackState.STATE_NONE;
 
     /**
@@ -352,6 +354,8 @@ public final class MainActivity extends Activity {
             public void onSeekTo(long position) {
                 String detailsJson = "{\"seekTime\":" + (position / 1000.0d) + "}";
                 dispatchBrowserMediaAction("seekto", detailsJson);
+                currentMediaPositionMs = position;
+                updateNativePlaybackState(currentPlaybackState);
             }
         });
         updateNativePlaybackState("none");
@@ -536,6 +540,10 @@ public final class MainActivity extends Activity {
             .putString(MediaMetadata.METADATA_KEY_ARTIST, currentMediaArtist)
             .putString(MediaMetadata.METADATA_KEY_ALBUM, currentMediaAlbum);
 
+        if (currentMediaDurationMs > 0) {
+            builder.putLong(MediaMetadata.METADATA_KEY_DURATION, currentMediaDurationMs);
+        }
+
         if (currentMediaArtwork != null) {
             builder.putBitmap(MediaMetadata.METADATA_KEY_ART, currentMediaArtwork);
             builder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, currentMediaArtwork);
@@ -634,17 +642,40 @@ public final class MainActivity extends Activity {
      * @param state browser Media Session playback state
      */
     private void updateNativePlaybackState(String state) {
+        updateNativePlaybackState(playbackStateFromWeb(state));
+    }
+
+    /**
+     * Updates Android's native MediaSession playback state.
+     *
+     * @param playbackStateValue Android PlaybackState constant
+     */
+    private void updateNativePlaybackState(int playbackStateValue) {
         if (mediaSession == null) {
             return;
         }
 
+        float playbackSpeed = playbackStateValue == PlaybackState.STATE_PLAYING ? 1.0f : 0.0f;
         PlaybackState playbackState = new PlaybackState.Builder()
             .setActions(MEDIA_SESSION_ACTIONS)
-            .setState(playbackStateFromWeb(state), PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+            .setState(playbackStateValue, currentMediaPositionMs, playbackSpeed)
             .build();
         mediaSession.setPlaybackState(playbackState);
         currentPlaybackState = playbackState.getState();
         updateMediaNotification();
+    }
+
+    /**
+     * Updates Android's native MediaSession progress for the current RPlayer track.
+     *
+     * @param positionMs current track position in milliseconds
+     * @param durationMs current track duration in milliseconds
+     */
+    private void updateNativeProgress(long positionMs, long durationMs) {
+        currentMediaPositionMs = Math.max(0, positionMs);
+        currentMediaDurationMs = Math.max(0, durationMs);
+        applyNativeMediaMetadata();
+        updateNativePlaybackState(currentPlaybackState);
     }
 
     /**
@@ -1001,6 +1032,17 @@ public final class MainActivity extends Activity {
         public void updatePlaybackState(String state) {
             Log.i(LOG_TAG, "Media playback state: " + state);
             runOnUiThread(() -> updateNativePlaybackState(state));
+        }
+
+        /**
+         * Receives current track progress calculated from RPlayer's own seeker.
+         *
+         * @param positionMs current track position in milliseconds
+         * @param durationMs current track duration in milliseconds
+         */
+        @JavascriptInterface
+        public void updateProgress(long positionMs, long durationMs) {
+            runOnUiThread(() -> updateNativeProgress(positionMs, durationMs));
         }
 
         /**
