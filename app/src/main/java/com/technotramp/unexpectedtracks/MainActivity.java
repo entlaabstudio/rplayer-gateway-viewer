@@ -2,6 +2,10 @@ package com.technotramp.unexpectedtracks;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Bitmap;
@@ -9,6 +13,7 @@ import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Base64;
 import android.util.Log;
@@ -45,7 +50,12 @@ import java.nio.charset.StandardCharsets;
 public final class MainActivity extends Activity {
     private static final String LOG_TAG = "RPlayerViewer";
     private static final int CREATE_DOWNLOAD_REQUEST_CODE = 1001;
+    private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
+    private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "music_player";
+    private static final String DEFAULT_MEDIA_TITLE = "Unexpected Tracks";
+    private static final String DEFAULT_MEDIA_ARTIST = "Technotramp";
+    private static final String DEFAULT_MEDIA_ALBUM = "Unexpected Tracks";
     private static final long MEDIA_SESSION_ACTIONS = PlaybackState.ACTION_PLAY
         | PlaybackState.ACTION_PAUSE
         | PlaybackState.ACTION_PLAY_PAUSE
@@ -64,6 +74,10 @@ public final class MainActivity extends Activity {
     private MediaSession mediaSession;
     private String downloadBridgeScriptSource;
     private String mediaSessionBridgeScriptSource;
+    private String currentMediaTitle = DEFAULT_MEDIA_TITLE;
+    private String currentMediaArtist = DEFAULT_MEDIA_ARTIST;
+    private String currentMediaAlbum = DEFAULT_MEDIA_ALBUM;
+    private int currentPlaybackState = PlaybackState.STATE_NONE;
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -73,6 +87,7 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         createLayout();
+        createMediaNotificationChannel();
         createMediaSession();
 
         try {
@@ -122,6 +137,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         closeActiveDownloadSession();
+        cancelMediaNotification();
 
         if (pendingDownload != null) {
             deleteTempFile(pendingDownload.file);
@@ -229,6 +245,7 @@ public final class MainActivity extends Activity {
     private void createMediaSession() {
         mediaSession = new MediaSession(this, "RPlayerGatewayViewer");
         mediaSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
+        mediaSession.setSessionActivity(createMediaSessionActivityIntent());
         mediaSession.setCallback(new MediaSession.Callback() {
             @Override
             public void onPlay() {
@@ -273,6 +290,46 @@ public final class MainActivity extends Activity {
         });
         updateNativePlaybackState("none");
         mediaSession.setActive(true);
+    }
+
+    /**
+     * Creates the Android notification channel used for OS media controls.
+     */
+    private void createMediaNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return;
+        }
+
+        NotificationChannel channel = new NotificationChannel(
+            MEDIA_NOTIFICATION_CHANNEL_ID,
+            "Music playback",
+            NotificationManager.IMPORTANCE_LOW
+        );
+        channel.setDescription("Shows RPlayer playback controls.");
+        channel.setShowBadge(false);
+        channel.setSound(null, null);
+
+        NotificationManager notificationManager = notificationManager();
+        if (notificationManager != null) {
+            notificationManager.createNotificationChannel(channel);
+        }
+    }
+
+    /**
+     * Creates the Activity intent opened from Android system media controls.
+     *
+     * @return pending intent pointing back to this viewer Activity
+     */
+    private PendingIntent createMediaSessionActivityIntent() {
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
+        return PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
     }
 
     /**
@@ -389,13 +446,18 @@ public final class MainActivity extends Activity {
             return;
         }
 
+        currentMediaTitle = mediaTextOrDefault(title, DEFAULT_MEDIA_TITLE);
+        currentMediaArtist = mediaTextOrDefault(artist, DEFAULT_MEDIA_ARTIST);
+        currentMediaAlbum = mediaTextOrDefault(album, DEFAULT_MEDIA_ALBUM);
+
         MediaMetadata metadata = new MediaMetadata.Builder()
-            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-            .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
-            .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
+            .putString(MediaMetadata.METADATA_KEY_TITLE, currentMediaTitle)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, currentMediaArtist)
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, currentMediaAlbum)
             .build();
         mediaSession.setMetadata(metadata);
         mediaSession.setActive(true);
+        updateMediaNotification();
     }
 
     /**
@@ -413,6 +475,88 @@ public final class MainActivity extends Activity {
             .setState(playbackStateFromWeb(state), PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
             .build();
         mediaSession.setPlaybackState(playbackState);
+        currentPlaybackState = playbackState.getState();
+        updateMediaNotification();
+    }
+
+    /**
+     * Shows or updates the Android media notification linked to the MediaSession.
+     */
+    private void updateMediaNotification() {
+        if (mediaSession == null) {
+            return;
+        }
+
+        if (currentPlaybackState == PlaybackState.STATE_NONE) {
+            cancelMediaNotification();
+            return;
+        }
+
+        Notification.Builder builder = notificationBuilder()
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(currentMediaTitle)
+            .setContentText(currentMediaArtist)
+            .setSubText(currentMediaAlbum)
+            .setContentIntent(createMediaSessionActivityIntent())
+            .setCategory(Notification.CATEGORY_TRANSPORT)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setOngoing(currentPlaybackState == PlaybackState.STATE_PLAYING)
+            .setStyle(new Notification.MediaStyle().setMediaSession(mediaSession.getSessionToken()));
+
+        NotificationManager notificationManager = notificationManager();
+        if (notificationManager != null) {
+            notificationManager.notify(MEDIA_NOTIFICATION_ID, builder.build());
+            Log.i(LOG_TAG, "Media notification updated: " + currentMediaTitle + ", state=" + currentPlaybackState);
+        }
+    }
+
+    /**
+     * Creates a Notification.Builder compatible with the current Android version.
+     *
+     * @return notification builder for media playback
+     */
+    private Notification.Builder notificationBuilder() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            return new Notification.Builder(this, MEDIA_NOTIFICATION_CHANNEL_ID);
+        }
+
+        return new Notification.Builder(this);
+    }
+
+    /**
+     * Cancels the media notification when playback is no longer active.
+     */
+    private void cancelMediaNotification() {
+        NotificationManager notificationManager = notificationManager();
+        if (notificationManager != null) {
+            notificationManager.cancel(MEDIA_NOTIFICATION_ID);
+        }
+    }
+
+    /**
+     * Returns Android's notification service.
+     *
+     * @return notification manager or null when the service is unavailable
+     */
+    private NotificationManager notificationManager() {
+        return (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+    }
+
+    /**
+     * Normalizes metadata text before it is shown in Android system UI.
+     *
+     * @param value metadata value received from the browser
+     * @param defaultValue fallback text used when the value is blank
+     * @return non-empty metadata text
+     */
+    private static String mediaTextOrDefault(String value, String defaultValue) {
+        if (value == null || value.trim().isEmpty()) {
+            return defaultValue;
+        }
+
+        return value.trim();
     }
 
     /**
