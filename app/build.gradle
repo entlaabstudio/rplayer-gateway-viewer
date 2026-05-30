@@ -10,13 +10,13 @@ android {
         applicationId "com.technotramp.unexpectedtracks"
         minSdk 23
         targetSdk 35
-        versionCode 1
+        versionCode 16
         versionName "0.1.0"
     }
 
     applicationVariants.all { variant ->
         variant.outputs.all { output ->
-            outputFileName = "unexpected-tracks-${variant.versionName}-${variant.name}.apk"
+            outputFileName = "unexpected-tracks-${variant.versionName}-build-${variant.versionCode}-${variant.name}.apk"
         }
     }
 }
