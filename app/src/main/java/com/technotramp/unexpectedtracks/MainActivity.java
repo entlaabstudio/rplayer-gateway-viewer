@@ -101,6 +101,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        configureSafeDisplayArea();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         createLayout();
         createMediaNotificationChannel();
@@ -190,6 +191,26 @@ public final class MainActivity extends Activity {
         artworkExecutor.shutdownNow();
 
         super.onDestroy();
+    }
+
+    /**
+     * Keeps the viewer inside the system safe area on devices with cutouts or rounded corners.
+     */
+    private void configureSafeDisplayArea() {
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+        getWindow().setStatusBarColor(0xff000000);
+        getWindow().setNavigationBarColor(0xff000000);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams layoutParams = getWindow().getAttributes();
+            layoutParams.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER;
+            getWindow().setAttributes(layoutParams);
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getWindow().setDecorFitsSystemWindows(true);
+        }
     }
 
     /**
