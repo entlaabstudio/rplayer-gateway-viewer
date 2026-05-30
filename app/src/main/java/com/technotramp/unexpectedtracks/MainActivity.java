@@ -43,6 +43,8 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Main Android entry point for the single-album viewer.
@@ -81,6 +83,7 @@ public final class MainActivity extends Activity {
     private DownloadSession activeDownloadSession;
     private PendingDownload pendingDownload;
     private MediaSession mediaSession;
+    private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
     private String downloadBridgeScriptSource;
     private String mediaSessionBridgeScriptSource;
     private String currentMediaTitle = DEFAULT_MEDIA_TITLE;
@@ -183,6 +186,8 @@ public final class MainActivity extends Activity {
         if (proxyServer != null) {
             proxyServer.close();
         }
+
+        artworkExecutor.shutdownNow();
 
         super.onDestroy();
     }
@@ -578,7 +583,11 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        Thread artworkThread = new Thread(() -> {
+        if (artworkExecutor.isShutdown()) {
+            return;
+        }
+
+        artworkExecutor.execute(() -> {
             Bitmap bitmap = loadArtworkBitmap(artworkUrl);
             if (bitmap == null) {
                 return;
@@ -594,8 +603,7 @@ public final class MainActivity extends Activity {
                 updateMediaNotification();
                 Log.i(LOG_TAG, "Media artwork updated: " + artworkUrl);
             });
-        }, "RPlayerArtworkLoader");
-        artworkThread.start();
+        });
     }
 
     /**
