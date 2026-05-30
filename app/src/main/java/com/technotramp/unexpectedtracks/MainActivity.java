@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.util.Base64;
 import android.util.Log;
+import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
@@ -86,6 +87,8 @@ public final class MainActivity extends Activity {
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
     private String downloadBridgeScriptSource;
     private String mediaSessionBridgeScriptSource;
+    private String displayModeBridgeScriptSource;
+    private boolean fullscreenDisplayMode;
     private String currentMediaTitle = DEFAULT_MEDIA_TITLE;
     private String currentMediaArtist = DEFAULT_MEDIA_ARTIST;
     private String currentMediaAlbum = DEFAULT_MEDIA_ALBUM;
@@ -197,20 +200,68 @@ public final class MainActivity extends Activity {
      * Keeps the viewer inside the system safe area on devices with cutouts or rounded corners.
      */
     private void configureSafeDisplayArea() {
+        fullscreenDisplayMode = false;
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         getWindow().setStatusBarColor(0xff000000);
         getWindow().setNavigationBarColor(0xff000000);
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            WindowManager.LayoutParams layoutParams = getWindow().getAttributes();
-            layoutParams.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER;
-            getWindow().setAttributes(layoutParams);
-        }
+        getWindow().getDecorView().setSystemUiVisibility(0);
+        setDisplayCutoutMode(WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             getWindow().setDecorFitsSystemWindows(true);
         }
+    }
+
+    /**
+     * Lets the viewer use the whole display after the user taps RPlayer fullscreen.
+     */
+    private void configureFullscreenDisplayArea() {
+        fullscreenDisplayMode = true;
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        getWindow().setStatusBarColor(0xff000000);
+        getWindow().setNavigationBarColor(0xff000000);
+        setDisplayCutoutMode(WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getWindow().setDecorFitsSystemWindows(false);
+        }
+
+        getWindow().getDecorView().setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        );
+    }
+
+    /**
+     * Applies display cutout handling when the Android version supports it.
+     *
+     * @param cutoutMode Android display cutout mode
+     */
+    private void setDisplayCutoutMode(int cutoutMode) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return;
+        }
+
+        WindowManager.LayoutParams layoutParams = getWindow().getAttributes();
+        layoutParams.layoutInDisplayCutoutMode = cutoutMode;
+        getWindow().setAttributes(layoutParams);
+    }
+
+    /**
+     * Toggles between the safe default display mode and user-requested fullscreen.
+     */
+    private void toggleDisplayMode() {
+        if (fullscreenDisplayMode) {
+            configureSafeDisplayArea();
+            return;
+        }
+
+        configureFullscreenDisplayArea();
     }
 
     /**
@@ -233,6 +284,7 @@ public final class MainActivity extends Activity {
 
         webView.addJavascriptInterface(new DownloadBridge(), "RPlayerGatewayDownloads");
         webView.addJavascriptInterface(new MediaSessionBridge(), "RPlayerGatewayMediaSessionNative");
+        webView.addJavascriptInterface(new DisplayModeBridge(), "RPlayerGatewayDisplayModeNative");
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -288,6 +340,7 @@ public final class MainActivity extends Activity {
                 Log.i(LOG_TAG, "WebView page finished: " + url);
                 injectDownloadBridge();
                 injectMediaSessionBridge();
+                injectDisplayModeBridge();
             }
         });
     }
@@ -499,6 +552,31 @@ public final class MainActivity extends Activity {
         }
 
         return mediaSessionBridgeScriptSource;
+    }
+
+    /**
+     * Injects the JavaScript bridge that connects RPlayer fullscreen icons to Android display modes.
+     */
+    private void injectDisplayModeBridge() {
+        try {
+            webView.evaluateJavascript(displayModeBridgeScript(), null);
+        } catch (IOException exception) {
+            Log.e(LOG_TAG, "Display mode bridge script could not be loaded.", exception);
+        }
+    }
+
+    /**
+     * Loads the Display Mode JavaScript bridge from Android assets.
+     *
+     * @return JavaScript source executed inside the WebView
+     * @throws IOException when the asset cannot be read
+     */
+    private String displayModeBridgeScript() throws IOException {
+        if (displayModeBridgeScriptSource == null) {
+            displayModeBridgeScriptSource = readAssetText("display-mode-bridge.js");
+        }
+
+        return displayModeBridgeScriptSource;
     }
 
     /**
@@ -1045,6 +1123,29 @@ public final class MainActivity extends Activity {
         }
 
         return cleanName;
+    }
+
+    /**
+     * JavaScript interface that lets RPlayer toggle Android display modes.
+     */
+    private final class DisplayModeBridge {
+        /**
+         * Toggles between the safe default display mode and immersive fullscreen.
+         */
+        @JavascriptInterface
+        public void toggleFullscreen() {
+            runOnUiThread(MainActivity.this::toggleDisplayMode);
+        }
+
+        /**
+         * Receives diagnostic messages from the JavaScript bridge.
+         *
+         * @param message diagnostic message
+         */
+        @JavascriptInterface
+        public void log(String message) {
+            Log.i(LOG_TAG, "Display mode bridge: " + message);
+        }
     }
 
     /**
