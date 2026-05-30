@@ -651,6 +651,16 @@ public final class MainActivity extends Activity {
      * @param playbackStateValue Android PlaybackState constant
      */
     private void updateNativePlaybackState(int playbackStateValue) {
+        updateNativePlaybackState(playbackStateValue, true);
+    }
+
+    /**
+     * Updates Android's native MediaSession playback state.
+     *
+     * @param playbackStateValue Android PlaybackState constant
+     * @param refreshNotification true when the visible media notification should be rebuilt
+     */
+    private void updateNativePlaybackState(int playbackStateValue, boolean refreshNotification) {
         if (mediaSession == null) {
             return;
         }
@@ -662,7 +672,10 @@ public final class MainActivity extends Activity {
             .build();
         mediaSession.setPlaybackState(playbackState);
         currentPlaybackState = playbackState.getState();
-        updateMediaNotification();
+
+        if (refreshNotification) {
+            updateMediaNotification();
+        }
     }
 
     /**
@@ -675,7 +688,7 @@ public final class MainActivity extends Activity {
         currentMediaPositionMs = Math.max(0, positionMs);
         currentMediaDurationMs = Math.max(0, durationMs);
         applyNativeMediaMetadata();
-        updateNativePlaybackState(currentPlaybackState);
+        updateNativePlaybackState(currentPlaybackState, false);
     }
 
     /**
