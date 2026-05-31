@@ -38,7 +38,10 @@ import java.util.concurrent.Executors;
 final class GatewayProxyServer implements Closeable {
     private static final String LOG_TAG = "RPlayerProxy";
     private static final String GATEWAY_ORIGIN = "https://ipfs.io";
-    private static final String ROOT_PATH = "/ipfs/bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm/index.htm";
+    private static final String IPFS_CID = "bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm";
+    private static final String ENTRY_FILE = "index.htm";
+    private static final String IPFS_ROOT_PATH = "/ipfs/" + IPFS_CID + "/";
+    private static final String ROOT_PATH = IPFS_ROOT_PATH + ENTRY_FILE;
     private static final int BUFFER_SIZE = 32 * 1024;
     private static final long SLOW_REQUEST_LOG_THRESHOLD_MS = 5000;
     private static final String CACHE_CONTROL_VALUE = "public, max-age=31536000, immutable";
@@ -131,7 +134,7 @@ final class GatewayProxyServer implements Closeable {
                 return;
             }
 
-            if (!request.path.startsWith("/ipfs/")) {
+            if (!isSafeAlbumPath(request.path)) {
                 writePlainResponse(socket, 404, "Not Found", "The proxy only serves the RPlayer IPFS path.");
                 return;
             }
@@ -304,6 +307,24 @@ final class GatewayProxyServer implements Closeable {
         outputStream.flush();
         closeQuietly(responseStream);
         return 0;
+    }
+
+    /**
+     * Checks whether a local request path is inside the fixed album root and safe to proxy.
+     *
+     * Path is expected to be the normalized local request path.
+     * Returns true when the path belongs to the configured album and contains no traversal markers.
+     */
+    private static boolean isSafeAlbumPath(String path) {
+        if (path == null || !path.startsWith(IPFS_ROOT_PATH)) {
+            return false;
+        }
+
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        return !lowerPath.contains("..")
+            && !lowerPath.contains("%2e")
+            && !lowerPath.contains("%5c")
+            && !lowerPath.contains("\\");
     }
 
     /**
