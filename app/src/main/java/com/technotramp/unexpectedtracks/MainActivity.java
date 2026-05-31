@@ -97,6 +97,7 @@ public final class MainActivity extends Activity {
     private long currentMediaPositionMs = PlaybackState.PLAYBACK_POSITION_UNKNOWN;
     private long currentMediaDurationMs = -1;
     private int currentPlaybackState = PlaybackState.STATE_NONE;
+    private boolean playbackForegroundServiceActive;
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -779,6 +780,7 @@ public final class MainActivity extends Activity {
             .build();
         mediaSession.setPlaybackState(playbackState);
         currentPlaybackState = playbackState.getState();
+        syncPlaybackForegroundService();
 
         if (refreshNotification) {
             updateMediaNotification();
@@ -889,12 +891,76 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * Keeps the foreground playback service aligned with the current playback state.
+     */
+    private void syncPlaybackForegroundService() {
+        if (currentPlaybackState == PlaybackState.STATE_PLAYING) {
+            startPlaybackForegroundService();
+            return;
+        }
+
+        stopPlaybackForegroundService();
+    }
+
+    /**
+     * Starts the foreground playback service while RPlayer is actively playing.
+     */
+    private void startPlaybackForegroundService() {
+        if (playbackForegroundServiceActive) {
+            return;
+        }
+
+        playbackForegroundServiceActive = true;
+        Intent intent = new Intent(this, PlaybackForegroundService.class);
+        intent.setAction(PlaybackForegroundService.ACTION_START);
+
+        if (usesForegroundServiceStartApi()) {
+            startForegroundService(intent);
+            return;
+        }
+
+        startService(intent);
+    }
+
+    /**
+     * Checks whether Android requires the dedicated foreground service start API.
+     *
+     * Returns true when startForegroundService must be used.
+     */
+    private boolean usesForegroundServiceStartApi() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O;
+    }
+
+    /**
+     * Stops the foreground playback service when active playback ends.
+     */
+    private void stopPlaybackForegroundService() {
+        if (!playbackForegroundServiceActive) {
+            return;
+        }
+
+        playbackForegroundServiceActive = false;
+        Intent intent = new Intent(this, PlaybackForegroundService.class);
+        intent.setAction(PlaybackForegroundService.ACTION_STOP);
+        startService(intent);
+    }
+
+    /**
+     * Checks whether Android requires notification channels.
+     *
+     * Returns true when notifications must be assigned to a channel.
+     */
+    private boolean usesNotificationChannels() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O;
+    }
+
+    /**
      * Creates a Notification.Builder compatible with the current Android version.
      *
      * @return notification builder for media playback
      */
     private Notification.Builder notificationBuilder() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (usesNotificationChannels()) {
             return new Notification.Builder(this, MEDIA_NOTIFICATION_CHANNEL_ID);
         }
 
