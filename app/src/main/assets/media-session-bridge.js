@@ -31,9 +31,12 @@
     var state = rootWindow.RPlayerGatewayMediaSessionState || {
         actionHandlers: {},
         installedWindows: [],
+        directPlayPending: false,
+        directPlayPendingAttemptId: 0,
         lastBrowserPlaybackState: '',
         lastMediaElement: null,
         lastMetadataSignature: '',
+        lastPlayAttemptId: 0,
         lastPlaybackState: '',
         lastProgressSignature: '',
         lastSeekerStartSeconds: 0
@@ -128,15 +131,15 @@
     }
 
     /**
-     * Checks whether a remembered media element still belongs to its document.
+     * Checks whether a remembered media element still exposes standard controls.
      *
      * @param {HTMLMediaElement|null} mediaElement Media element to validate.
      * @return {boolean} True when the element can still be controlled.
      */
-    function isConnectedMediaElement(mediaElement) {
+    function isUsableMediaElement(mediaElement) {
         return !!mediaElement
-            && !!mediaElement.ownerDocument
-            && mediaElement.ownerDocument.contains(mediaElement);
+            && typeof mediaElement.play === 'function'
+            && typeof mediaElement.pause === 'function';
     }
 
     /**
@@ -156,11 +159,15 @@
         }
 
         mediaElement.addEventListener('playing', function() {
+            state.directPlayPending = false;
+            state.directPlayPendingAttemptId = 0;
             debugLog('Media element event: playing');
             sendPlaybackStateToAndroid('playing');
         });
 
         mediaElement.addEventListener('pause', function() {
+            state.directPlayPending = false;
+            state.directPlayPendingAttemptId = 0;
             debugLog('Media element event: pause');
             sendPlaybackStateToAndroid('paused');
         });
@@ -180,6 +187,8 @@
 
         mediaElement.addEventListener('error', function() {
             var errorCode = mediaElement.error ? mediaElement.error.code : 'unknown';
+            state.directPlayPending = false;
+            state.directPlayPendingAttemptId = 0;
             debugLog('Media element event: error ' + errorCode);
             sendPlaybackStateToAndroid('paused');
         });
@@ -193,7 +202,7 @@
      * @return {HTMLMediaElement|null} Last known or first available media element.
      */
     function findMediaElementForControl() {
-        if (isConnectedMediaElement(state.lastMediaElement)) {
+        if (isUsableMediaElement(state.lastMediaElement)) {
             return state.lastMediaElement;
         }
 
@@ -216,6 +225,94 @@
     }
 
     /**
+     * Formats buffered media ranges for diagnostics.
+     *
+     * @param {HTMLMediaElement} mediaElement Media element to inspect.
+     * @return {string} Buffered ranges in seconds.
+     */
+    function mediaBufferedRanges(mediaElement) {
+        var ranges = [];
+
+        try {
+            for (var index = 0; index < mediaElement.buffered.length; index += 1) {
+                ranges.push(mediaElement.buffered.start(index).toFixed(2) + '-' + mediaElement.buffered.end(index).toFixed(2));
+            }
+        } catch (error) {
+            return 'unavailable: ' + error.message;
+        }
+
+        return ranges.length > 0 ? ranges.join(',') : 'empty';
+    }
+
+    /**
+     * Writes a compact diagnostic snapshot of the current media element.
+     *
+     * @param {HTMLMediaElement} mediaElement Media element to inspect.
+     * @param {string} reason Diagnostic reason.
+     */
+    function logMediaElementDiagnostics(mediaElement, reason) {
+        var source = mediaElement.currentSrc || mediaElement.src || '';
+        var errorCode = mediaElement.error ? mediaElement.error.code : 'none';
+        var duration = Number.isFinite(mediaElement.duration) ? mediaElement.duration.toFixed(3) : String(mediaElement.duration);
+
+        debugLog(
+            'Media element diagnostics [' + reason + ']: '
+                + 'paused=' + mediaElement.paused
+                + ', ended=' + mediaElement.ended
+                + ', readyState=' + mediaElement.readyState
+                + ', networkState=' + mediaElement.networkState
+                + ', currentTime=' + mediaElement.currentTime.toFixed(3)
+                + ', duration=' + duration
+                + ', buffered=' + mediaBufferedRanges(mediaElement)
+                + ', error=' + errorCode
+                + ', source=' + source
+        );
+    }
+
+    /**
+     * Clears a pending direct play attempt when a later user action supersedes it.
+     *
+     * @param {string} reason Reason written to diagnostics.
+     */
+    function clearPendingDirectPlay(reason) {
+        if (!state.directPlayPending) {
+            return;
+        }
+
+        debugLog('Direct media element play pending state cleared: ' + reason);
+        state.directPlayPending = false;
+        state.directPlayPendingAttemptId = 0;
+    }
+
+    /**
+     * Aligns a stale media element before Android asks RPlayer to resume playback.
+     *
+     * @param {HTMLMediaElement|null} mediaElement Media element to inspect.
+     * @return {boolean} True when a stale element was paused before the play action.
+     */
+    function pauseStaleMediaElementBeforePlay(mediaElement) {
+        if (!isUsableMediaElement(mediaElement)
+            || state.lastPlaybackState !== 'paused'
+            || mediaElement.paused
+        ) {
+            return false;
+        }
+
+        debugLog('Media element looks stale before external play; pausing it before resume.');
+        logMediaElementDiagnostics(mediaElement, 'stale before external play');
+
+        try {
+            mediaElement.pause();
+            clearPendingDirectPlay('stale media element was paused');
+            logMediaElementDiagnostics(mediaElement, 'after stale pause');
+            return true;
+        } catch (error) {
+            debugLog('Could not pause stale media element before play: ' + error.message);
+            return false;
+        }
+    }
+
+    /**
      * Requests playback through the standard HTMLMediaElement API.
      */
     function requestMediaElementPlay() {
@@ -226,20 +323,55 @@
             return;
         }
 
+        if (state.directPlayPending) {
+            debugLog('Direct media element play already pending #' + state.directPlayPendingAttemptId + '; skipping duplicate request.');
+            logMediaElementDiagnostics(mediaElement, 'duplicate play skipped #' + state.directPlayPendingAttemptId);
+            return;
+        }
+
+        var playAttemptId = state.lastPlayAttemptId + 1;
+        state.lastPlayAttemptId = playAttemptId;
+        state.directPlayPending = true;
+        state.directPlayPendingAttemptId = playAttemptId;
+        logMediaElementDiagnostics(mediaElement, 'before play #' + playAttemptId);
+
         try {
             var playResult = mediaElement.play();
-            debugLog('Direct media element play requested.');
+            debugLog('Direct media element play requested #' + playAttemptId + '.');
 
             if (playResult && typeof playResult.then === 'function') {
                 playResult.then(function() {
-                    debugLog('Direct media element play accepted.');
+                    if (state.directPlayPendingAttemptId !== playAttemptId) {
+                        debugLog('Ignoring superseded direct media element play accepted #' + playAttemptId + '.');
+                        return;
+                    }
+
+                    state.directPlayPending = false;
+                    state.directPlayPendingAttemptId = 0;
+                    debugLog('Direct media element play accepted #' + playAttemptId + '.');
                 }).catch(function(error) {
-                    debugLog('Direct media element play rejected: ' + error.message);
+                    if (state.directPlayPendingAttemptId !== playAttemptId) {
+                        debugLog('Ignoring superseded direct media element play rejected #' + playAttemptId + ': ' + error.message);
+                        return;
+                    }
+
+                    state.directPlayPending = false;
+                    state.directPlayPendingAttemptId = 0;
+                    debugLog('Direct media element play rejected #' + playAttemptId + ': ' + error.message);
+                    logMediaElementDiagnostics(mediaElement, 'play rejected #' + playAttemptId);
                     sendPlaybackStateToAndroid('paused');
                 });
+
+            } else {
+                state.directPlayPending = false;
+                state.directPlayPendingAttemptId = 0;
+                debugLog('Direct media element play returned no Promise #' + playAttemptId + '.');
             }
         } catch (error) {
-            debugLog('Direct media element play failed: ' + error.message);
+            state.directPlayPending = false;
+            state.directPlayPendingAttemptId = 0;
+            debugLog('Direct media element play failed #' + playAttemptId + ': ' + error.message);
+            logMediaElementDiagnostics(mediaElement, 'play failed #' + playAttemptId);
             sendPlaybackStateToAndroid('paused');
         }
     }
@@ -332,6 +464,16 @@
         if (typeof handler !== 'function') {
             debugLog('No RPlayer media action handler registered for: ' + action);
             return;
+        }
+
+        if (action === 'play') {
+            var mediaElement = findMediaElementForControl();
+            var staleElementWasPaused = pauseStaleMediaElementBeforePlay(mediaElement);
+
+            if (state.directPlayPending && !staleElementWasPaused) {
+                debugLog('Skipping duplicate RPlayer play action while direct play is pending #' + state.directPlayPendingAttemptId + '.');
+                return;
+            }
         }
 
         debugLog('Dispatching action to RPlayer: ' + action);
