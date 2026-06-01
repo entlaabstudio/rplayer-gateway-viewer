@@ -13,6 +13,7 @@ The viewer does not launch a general-purpose browser. Android WebView loads a lo
 - The proxy passes the `Range` header for audio seeking.
 - The proxy allows only paths under `/ipfs/`.
 - External addresses outside the local proxy are blocked in the prototype.
+- The Android foreground playback service intentionally remains active while playback is paused for broader device compatibility. Some Android WebView builds may still suspend the audio pipeline after a longer pause.
 
 ## Build
 
