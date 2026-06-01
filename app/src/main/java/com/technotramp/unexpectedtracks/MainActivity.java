@@ -44,6 +44,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -65,6 +66,7 @@ public final class MainActivity extends Activity {
     private static final String ACTION_MEDIA_PREVIOUS = "com.technotramp.unexpectedtracks.action.MEDIA_PREVIOUS";
     private static final String ACTION_MEDIA_PLAY_PAUSE = "com.technotramp.unexpectedtracks.action.MEDIA_PLAY_PAUSE";
     private static final String ACTION_MEDIA_NEXT = "com.technotramp.unexpectedtracks.action.MEDIA_NEXT";
+    private static final String EXTRA_MEDIA_ACTION_TOKEN = "com.technotramp.unexpectedtracks.extra.MEDIA_ACTION_TOKEN";
     private static final int MEDIA_PREVIOUS_REQUEST_CODE = 2002;
     private static final int MEDIA_PLAY_PAUSE_REQUEST_CODE = 2003;
     private static final int MEDIA_NEXT_REQUEST_CODE = 2004;
@@ -85,6 +87,7 @@ public final class MainActivity extends Activity {
     private PendingDownload pendingDownload;
     private MediaSession mediaSession;
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
+    private final String mediaActionToken = UUID.randomUUID().toString();
     private String downloadBridgeScriptSource;
     private String mediaSessionBridgeScriptSource;
     private String displayModeBridgeScriptSource;
@@ -93,6 +96,7 @@ public final class MainActivity extends Activity {
     private String currentMediaArtist = DEFAULT_MEDIA_ARTIST;
     private String currentMediaAlbum = DEFAULT_MEDIA_ALBUM;
     private String currentMediaArtworkUrl = "";
+    private String localProxyAlbumRootUrl = "";
     private Bitmap currentMediaArtwork;
     private long currentMediaPositionMs = PlaybackState.PLAYBACK_POSITION_UNKNOWN;
     private long currentMediaDurationMs = -1;
@@ -116,6 +120,7 @@ public final class MainActivity extends Activity {
         try {
             proxyServer = new GatewayProxyServer(mediaSessionBridgeScript(), new File(getFilesDir(), "rplayer-ipfs-cache"));
             proxyServer.start();
+            localProxyAlbumRootUrl = proxyServer.albumRootUrl();
             configureWebView();
             webView.loadUrl(proxyServer.viewerUrl());
         } catch (IOException exception) {
@@ -358,6 +363,15 @@ public final class MainActivity extends Activity {
         }
 
         String action = intent.getAction();
+        if (!isMediaNotificationAction(action)) {
+            return;
+        }
+
+        if (!isTrustedMediaActionIntent(intent)) {
+            Log.w(LOG_TAG, "Ignored untrusted media notification action: " + action);
+            return;
+        }
+
         if (ACTION_MEDIA_PREVIOUS.equals(action)) {
             Log.i(LOG_TAG, "Media notification action: previous");
             dispatchBrowserMediaAction("previoustrack");
@@ -374,6 +388,28 @@ public final class MainActivity extends Activity {
             Log.i(LOG_TAG, "Media notification action: next");
             dispatchBrowserMediaAction("nexttrack");
         }
+    }
+
+    /**
+     * Checks whether an Activity intent is one of the internal notification actions.
+     *
+     * @param action intent action to inspect
+     * @return true when the action belongs to the media notification controls
+     */
+    private boolean isMediaNotificationAction(String action) {
+        return ACTION_MEDIA_PREVIOUS.equals(action)
+            || ACTION_MEDIA_PLAY_PAUSE.equals(action)
+            || ACTION_MEDIA_NEXT.equals(action);
+    }
+
+    /**
+     * Verifies that a media action came from this process' immutable PendingIntent.
+     *
+     * @param intent Activity intent carrying a media notification action
+     * @return true when the private process token matches
+     */
+    private boolean isTrustedMediaActionIntent(Intent intent) {
+        return mediaActionToken.equals(intent.getStringExtra(EXTRA_MEDIA_ACTION_TOKEN));
     }
 
     /**
@@ -740,9 +776,10 @@ public final class MainActivity extends Activity {
      * @param artworkUrl artwork URL resolved inside the WebView
      * @return true when the URL points to the local proxy
      */
-    private static boolean isLocalArtworkUrl(String artworkUrl) {
+    private boolean isLocalArtworkUrl(String artworkUrl) {
         return artworkUrl != null
-            && (artworkUrl.startsWith("http://127.0.0.1:") || artworkUrl.startsWith("http://localhost:"));
+            && !localProxyAlbumRootUrl.isEmpty()
+            && artworkUrl.startsWith(localProxyAlbumRootUrl);
     }
 
     /**
@@ -855,6 +892,7 @@ public final class MainActivity extends Activity {
     private PendingIntent createMediaActionIntent(String action, int requestCode) {
         Intent intent = new Intent(this, MainActivity.class);
         intent.setAction(action);
+        intent.putExtra(EXTRA_MEDIA_ACTION_TOKEN, mediaActionToken);
         intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
 
         return PendingIntent.getActivity(

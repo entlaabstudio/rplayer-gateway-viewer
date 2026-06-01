@@ -85,7 +85,25 @@ final class GatewayProxyServer implements Closeable {
      * @return local proxy URL for the configured RPlayer index file
      */
     String viewerUrl() {
-        return "http://127.0.0.1:" + serverSocket.getLocalPort() + ROOT_PATH;
+        return localOrigin() + ROOT_PATH;
+    }
+
+    /**
+     * Builds the local album root URL accepted by native loaders.
+     *
+     * @return local proxy URL prefix for the configured album root
+     */
+    String albumRootUrl() {
+        return localOrigin() + IPFS_ROOT_PATH;
+    }
+
+    /**
+     * Builds the local origin selected for this proxy instance.
+     *
+     * @return local HTTP origin with the selected random port
+     */
+    private String localOrigin() {
+        return "http://127.0.0.1:" + serverSocket.getLocalPort();
     }
 
     /**
@@ -621,7 +639,18 @@ final class GatewayProxyServer implements Closeable {
      * Writes one HTTP header line using the wire encoding expected by HTTP/1.1.
      */
     private static void writeHeader(BufferedOutputStream outputStream, String name, String value) throws IOException {
-        outputStream.write((name + ": " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+        outputStream.write((name + ": " + safeHeaderValue(value) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+    }
+
+    /**
+     * Removes characters that could break one HTTP header or cache metadata line.
+     */
+    private static String safeHeaderValue(String value) {
+        if (value == null) {
+            return "";
+        }
+
+        return value.replace('\r', ' ').replace('\n', ' ').trim();
     }
 
     /**
@@ -784,9 +813,10 @@ final class GatewayProxyServer implements Closeable {
          * @param contentLength complete cached body length
          */
         private CacheMetadata(String contentType, String lastModified, String etag, long contentLength) {
-            this.contentType = contentType == null || contentType.trim().isEmpty() ? "application/octet-stream" : contentType;
-            this.lastModified = lastModified == null ? "" : lastModified;
-            this.etag = etag == null ? "" : etag;
+            String safeContentType = safeHeaderValue(contentType);
+            this.contentType = safeContentType.isEmpty() ? "application/octet-stream" : safeContentType;
+            this.lastModified = safeHeaderValue(lastModified);
+            this.etag = safeHeaderValue(etag);
             this.contentLength = contentLength;
         }
 
