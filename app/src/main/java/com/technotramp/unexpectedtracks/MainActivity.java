@@ -172,6 +172,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         closeActiveDownloadSession();
+        stopPlaybackForegroundService();
         cancelMediaNotification();
 
         if (pendingDownload != null) {
@@ -894,16 +895,16 @@ public final class MainActivity extends Activity {
      * Keeps the foreground playback service aligned with the current playback state.
      */
     private void syncPlaybackForegroundService() {
-        if (currentPlaybackState == PlaybackState.STATE_PLAYING) {
-            startPlaybackForegroundService();
+        if (currentPlaybackState == PlaybackState.STATE_NONE) {
+            stopPlaybackForegroundService();
             return;
         }
 
-        stopPlaybackForegroundService();
+        startPlaybackForegroundService();
     }
 
     /**
-     * Starts the foreground playback service while RPlayer is actively playing.
+     * Starts the foreground playback service while RPlayer has an active media state.
      */
     private void startPlaybackForegroundService() {
         if (playbackForegroundServiceActive) {

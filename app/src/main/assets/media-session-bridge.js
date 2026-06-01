@@ -31,6 +31,8 @@
     var state = rootWindow.RPlayerGatewayMediaSessionState || {
         actionHandlers: {},
         installedWindows: [],
+        lastBrowserPlaybackState: '',
+        lastMediaElement: null,
         lastMetadataSignature: '',
         lastPlaybackState: '',
         lastProgressSignature: '',
@@ -101,6 +103,145 @@
         state.lastPlaybackState = normalizedState;
         debugLog('Playback state captured: ' + normalizedState);
         nativeBridge.updatePlaybackState(normalizedState);
+    }
+
+    /**
+     * Handles browser playbackState changes that can be optimistic in WebView.
+     *
+     * @param {string} playbackState Browser Media Session playback state.
+     */
+    function sendBrowserPlaybackStateToAndroid(playbackState) {
+        var normalizedState = String(playbackState || 'none');
+
+        if (normalizedState === state.lastBrowserPlaybackState) {
+            return;
+        }
+
+        state.lastBrowserPlaybackState = normalizedState;
+
+        if (normalizedState === 'playing') {
+            debugLog('Browser playbackState says playing; waiting for media element confirmation.');
+            return;
+        }
+
+        sendPlaybackStateToAndroid(normalizedState);
+    }
+
+    /**
+     * Checks whether a remembered media element still belongs to its document.
+     *
+     * @param {HTMLMediaElement|null} mediaElement Media element to validate.
+     * @return {boolean} True when the element can still be controlled.
+     */
+    function isConnectedMediaElement(mediaElement) {
+        return !!mediaElement
+            && !!mediaElement.ownerDocument
+            && mediaElement.ownerDocument.contains(mediaElement);
+    }
+
+    /**
+     * Stores the current media element and attaches state listeners once.
+     *
+     * @param {HTMLMediaElement} mediaElement Media element used by RPlayer.
+     */
+    function rememberMediaElement(mediaElement) {
+        if (!mediaElement) {
+            return;
+        }
+
+        state.lastMediaElement = mediaElement;
+
+        if (mediaElement.RPlayerGatewayViewerMediaElementHook) {
+            return;
+        }
+
+        mediaElement.addEventListener('playing', function() {
+            debugLog('Media element event: playing');
+            sendPlaybackStateToAndroid('playing');
+        });
+
+        mediaElement.addEventListener('pause', function() {
+            debugLog('Media element event: pause');
+            sendPlaybackStateToAndroid('paused');
+        });
+
+        mediaElement.addEventListener('ended', function() {
+            debugLog('Media element event: ended');
+            sendPlaybackStateToAndroid('paused');
+        });
+
+        mediaElement.addEventListener('waiting', function() {
+            debugLog('Media element event: waiting');
+        });
+
+        mediaElement.addEventListener('stalled', function() {
+            debugLog('Media element event: stalled');
+        });
+
+        mediaElement.addEventListener('error', function() {
+            var errorCode = mediaElement.error ? mediaElement.error.code : 'unknown';
+            debugLog('Media element event: error ' + errorCode);
+            sendPlaybackStateToAndroid('paused');
+        });
+
+        mediaElement.RPlayerGatewayViewerMediaElementHook = true;
+    }
+
+    /**
+     * Finds the best media element for direct standard playback control.
+     *
+     * @return {HTMLMediaElement|null} Last known or first available media element.
+     */
+    function findMediaElementForControl() {
+        if (isConnectedMediaElement(state.lastMediaElement)) {
+            return state.lastMediaElement;
+        }
+
+        for (var index = state.installedWindows.length - 1; index >= 0; index -= 1) {
+            var targetWindow = state.installedWindows[index];
+
+            try {
+                var mediaElement = targetWindow.document.querySelector('audio, video');
+
+                if (mediaElement) {
+                    rememberMediaElement(mediaElement);
+                    return mediaElement;
+                }
+            } catch (error) {
+                debugLog('Could not inspect media element for control: ' + error.message);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Requests playback through the standard HTMLMediaElement API.
+     */
+    function requestMediaElementPlay() {
+        var mediaElement = findMediaElementForControl();
+
+        if (!mediaElement || typeof mediaElement.play !== 'function') {
+            debugLog('No media element available for direct play request.');
+            return;
+        }
+
+        try {
+            var playResult = mediaElement.play();
+            debugLog('Direct media element play requested.');
+
+            if (playResult && typeof playResult.then === 'function') {
+                playResult.then(function() {
+                    debugLog('Direct media element play accepted.');
+                }).catch(function(error) {
+                    debugLog('Direct media element play rejected: ' + error.message);
+                    sendPlaybackStateToAndroid('paused');
+                });
+            }
+        } catch (error) {
+            debugLog('Direct media element play failed: ' + error.message);
+            sendPlaybackStateToAndroid('paused');
+        }
     }
 
     /**
@@ -195,6 +336,10 @@
 
         debugLog('Dispatching action to RPlayer: ' + action);
         handler(normalizeActionDetails(action, details));
+
+        if (action === 'play') {
+            requestMediaElementPlay();
+        }
     }
 
     /**
@@ -287,7 +432,7 @@
         };
 
         installPropertyWrapper(mediaSession, 'metadata', currentMetadata, sendMetadataToAndroid);
-        installPropertyWrapper(mediaSession, 'playbackState', currentPlaybackState, sendPlaybackStateToAndroid);
+        installPropertyWrapper(mediaSession, 'playbackState', currentPlaybackState, sendBrowserPlaybackStateToAndroid);
 
         if (!targetWindow.navigator.mediaSession) {
             try {
@@ -309,12 +454,28 @@
                 var originalPause = mediaPrototype.pause;
 
                 mediaPrototype.play = function() {
-                    sendPlaybackStateToAndroid('playing');
-                    return originalPlay.apply(this, arguments);
+                    rememberMediaElement(this);
+
+                    try {
+                        var playResult = originalPlay.apply(this, arguments);
+
+                        if (playResult && typeof playResult.catch === 'function') {
+                            playResult.catch(function(error) {
+                                debugLog('Media element play rejected: ' + error.message);
+                                sendPlaybackStateToAndroid('paused');
+                            });
+                        }
+
+                        return playResult;
+                    } catch (error) {
+                        debugLog('Media element play failed: ' + error.message);
+                        sendPlaybackStateToAndroid('paused');
+                        throw error;
+                    }
                 };
 
                 mediaPrototype.pause = function() {
-                    sendPlaybackStateToAndroid('paused');
+                    rememberMediaElement(this);
                     return originalPause.apply(this, arguments);
                 };
 
@@ -330,7 +491,7 @@
                 sendMetadataToAndroid(targetWindow.navigator.mediaSession.metadata);
 
                 if (browserPlaybackState && browserPlaybackState !== 'none') {
-                    sendPlaybackStateToAndroid(browserPlaybackState);
+                    sendBrowserPlaybackStateToAndroid(browserPlaybackState);
                 }
 
                 sendProgressToAndroid(targetWindow);
