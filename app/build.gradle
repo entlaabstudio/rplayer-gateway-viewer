@@ -6,6 +6,10 @@ android {
     namespace "com.technotramp.unexpectedtracks"
     compileSdk 35
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId "com.technotramp.unexpectedtracks"
         minSdk 23
@@ -14,9 +18,36 @@ android {
         versionName "0.1.0"
     }
 
+    flavorDimensions "album"
+
+    productFlavors {
+        unexpectedTracks {
+            dimension "album"
+            applicationId "com.technotramp.unexpectedtracks"
+            buildConfigField "String", "IPFS_CID", "\"bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm\""
+            buildConfigField "String", "APP_SLUG", "\"unexpected-tracks\""
+            buildConfigField "String", "DEFAULT_MEDIA_TITLE", "\"Unexpected Tracks\""
+            buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"Technotramp\""
+            buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Unexpected Tracks\""
+            buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"unexpected-tracks.zip\""
+        }
+
+        dreamer {
+            dimension "album"
+            applicationId "com.michaldivis.dreamer"
+            buildConfigField "String", "IPFS_CID", "\"bafybeifdc2rfwjxe7hdntvgkabir7ocbikbdamylhv7ojewtnrm3pdvbri\""
+            buildConfigField "String", "APP_SLUG", "\"dreamer\""
+            buildConfigField "String", "DEFAULT_MEDIA_TITLE", "\"Dreamer\""
+            buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"Michal Diviš\""
+            buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Dreamer\""
+            buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"dreamer.zip\""
+        }
+    }
+
     applicationVariants.all { variant ->
         variant.outputs.all { output ->
-            outputFileName = "unexpected-tracks-${variant.versionName}-build-${variant.versionCode}-${variant.name}.apk"
+            String appSlug = variant.productFlavors[0].buildConfigFields["APP_SLUG"].value.replace("\"", "")
+            outputFileName = "${appSlug}-${variant.versionName}-build-${variant.versionCode}-${variant.name}.apk"
         }
     }
 }

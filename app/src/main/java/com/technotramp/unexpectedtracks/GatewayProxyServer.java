@@ -38,7 +38,7 @@ import java.util.concurrent.Executors;
 final class GatewayProxyServer implements Closeable {
     private static final String LOG_TAG = "RPlayerProxy";
     private static final String GATEWAY_ORIGIN = "https://ipfs.io";
-    private static final String IPFS_CID = "bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm";
+    private static final String IPFS_CID = BuildConfig.IPFS_CID;
     private static final String ENTRY_FILE = "index.htm";
     private static final String IPFS_ROOT_PATH = "/ipfs/" + IPFS_CID + "/";
     private static final String ROOT_PATH = IPFS_ROOT_PATH + ENTRY_FILE;

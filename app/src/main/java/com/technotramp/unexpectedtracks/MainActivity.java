@@ -60,13 +60,13 @@ public final class MainActivity extends Activity {
     private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
     private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "music_player";
-    private static final String DEFAULT_MEDIA_TITLE = "Unexpected Tracks";
-    private static final String DEFAULT_MEDIA_ARTIST = "Technotramp";
-    private static final String DEFAULT_MEDIA_ALBUM = "Unexpected Tracks";
-    private static final String ACTION_MEDIA_PREVIOUS = "com.technotramp.unexpectedtracks.action.MEDIA_PREVIOUS";
-    private static final String ACTION_MEDIA_PLAY_PAUSE = "com.technotramp.unexpectedtracks.action.MEDIA_PLAY_PAUSE";
-    private static final String ACTION_MEDIA_NEXT = "com.technotramp.unexpectedtracks.action.MEDIA_NEXT";
-    private static final String EXTRA_MEDIA_ACTION_TOKEN = "com.technotramp.unexpectedtracks.extra.MEDIA_ACTION_TOKEN";
+    private static final String DEFAULT_MEDIA_TITLE = BuildConfig.DEFAULT_MEDIA_TITLE;
+    private static final String DEFAULT_MEDIA_ARTIST = BuildConfig.DEFAULT_MEDIA_ARTIST;
+    private static final String DEFAULT_MEDIA_ALBUM = BuildConfig.DEFAULT_MEDIA_ALBUM;
+    private static final String ACTION_MEDIA_PREVIOUS = BuildConfig.APPLICATION_ID + ".action.MEDIA_PREVIOUS";
+    private static final String ACTION_MEDIA_PLAY_PAUSE = BuildConfig.APPLICATION_ID + ".action.MEDIA_PLAY_PAUSE";
+    private static final String ACTION_MEDIA_NEXT = BuildConfig.APPLICATION_ID + ".action.MEDIA_NEXT";
+    private static final String EXTRA_MEDIA_ACTION_TOKEN = BuildConfig.APPLICATION_ID + ".extra.MEDIA_ACTION_TOKEN";
     private static final int MEDIA_PREVIOUS_REQUEST_CODE = 2002;
     private static final int MEDIA_PLAY_PAUSE_REQUEST_CODE = 2003;
     private static final int MEDIA_NEXT_REQUEST_CODE = 2004;
@@ -1219,12 +1219,12 @@ public final class MainActivity extends Activity {
      */
     private static String sanitizeFileName(String fileName) {
         if (fileName == null) {
-            return "unexpected-tracks.zip";
+            return BuildConfig.DEFAULT_DOWNLOAD_FILE_NAME;
         }
 
         String cleanName = fileName.trim().replace('"', '_').replaceAll("[\\\\/:*?<>|]", "_");
         if (cleanName.isEmpty()) {
-            return "unexpected-tracks.zip";
+            return BuildConfig.DEFAULT_DOWNLOAD_FILE_NAME;
         }
 
         return cleanName;
