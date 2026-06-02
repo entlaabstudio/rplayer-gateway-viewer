@@ -6,6 +6,7 @@ Current variants:
 
 - `unexpectedTracks`: `https://ipfs.io/ipfs/bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm/index.htm`
 - `dreamer`: `https://ipfs.io/ipfs/bafybeifdc2rfwjxe7hdntvgkabir7ocbikbdamylhv7ojewtnrm3pdvbri/index.htm`
+- `krehkyMechanismus`: `https://ipfs.io/ipfs/bafybeigmjwx26qgubv6ddciwuwbatpgcdrw6mnhgz4qy5bd55nb3trosfu/index.htm`
 
 The viewer does not launch a general-purpose browser. Android WebView loads a local `127.0.0.1` address served by a small proxy. The proxy fetches data from `ipfs.io`, removes the gateway download behavior that prevents rendering, and fills MIME types by file extension.
 
@@ -25,6 +26,7 @@ The project is prepared for Gradle with the Android plugin, and can also be open
 ```sh
 ./gradlew :app:assembleUnexpectedTracksDebug
 ./gradlew :app:assembleDreamerDebug
+./gradlew :app:assembleKrehkyMechanismusDebug
 ```
 
 Release builds use the same flavor names:
@@ -32,6 +34,7 @@ Release builds use the same flavor names:
 ```sh
 ./gradlew :app:assembleUnexpectedTracksRelease
 ./gradlew :app:assembleDreamerRelease
+./gradlew :app:assembleKrehkyMechanismusRelease
 ```
 
 The build command may need Android SDK and Java available on the host machine.

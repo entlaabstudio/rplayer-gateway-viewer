@@ -42,6 +42,17 @@ android {
             buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Dreamer\""
             buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"dreamer.zip\""
         }
+
+        krehkyMechanismus {
+            dimension "album"
+            applicationId "cz.prvnihore.krehkymechanismus"
+            buildConfigField "String", "IPFS_CID", "\"bafybeigmjwx26qgubv6ddciwuwbatpgcdrw6mnhgz4qy5bd55nb3trosfu\""
+            buildConfigField "String", "APP_SLUG", "\"krehky-mechanismus\""
+            buildConfigField "String", "DEFAULT_MEDIA_TITLE", "\"Křehký mechanismus pozemského štěstí\""
+            buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"První hoře\""
+            buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Křehký mechanismus pozemského štěstí\""
+            buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"krehky-mechanismus.zip\""
+        }
     }
 
     applicationVariants.all { variant ->
