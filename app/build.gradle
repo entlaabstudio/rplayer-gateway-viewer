@@ -14,8 +14,8 @@ android {
         applicationId "com.technotramp.unexpectedtracks"
         minSdk 23
         targetSdk 35
-        versionCode 34
-        versionName "0.1.3"
+        versionCode 35
+        versionName "0.1.4"
     }
 
     flavorDimensions "album"
@@ -34,7 +34,7 @@ android {
         dreamer {
             dimension "album"
             applicationId "com.michaldivis.dreamer"
-            buildConfigField "String", "IPFS_CID", "\"bafybeifdc2rfwjxe7hdntvgkabir7ocbikbdamylhv7ojewtnrm3pdvbri\""
+            buildConfigField "String", "IPFS_CID", "\"bafybeiaknjru5kws3exdyleahfleoh3ud3bp5ve7l3e7yeqmzo3sp7rcii\""
             buildConfigField "String", "DEFAULT_MEDIA_TITLE", "\"Dreamer\""
             buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"Michal Diviš\""
             buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Dreamer\""

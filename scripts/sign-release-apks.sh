@@ -11,13 +11,13 @@ KEY_ALIAS="${KEY_ALIAS:-unexpected-tracks}"
 
 if [[ -z "$VERSION_BUILD" ]]; then
     echo "Usage: $0 <version-build>"
-    echo "Example: $0 0.1.3-build-34"
+    echo "Example: $0 0.1.4-build-35"
     exit 1
 fi
 
 if [[ ! "$VERSION_BUILD" =~ ^[0-9]+\.[0-9]+\.[0-9]+-build-[0-9]+$ ]]; then
     echo "Invalid version-build value: $VERSION_BUILD"
-    echo "Expected format: 0.1.3-build-34"
+    echo "Expected format: 0.1.4-build-35"
     exit 1
 fi
 

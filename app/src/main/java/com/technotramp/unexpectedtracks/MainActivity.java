@@ -308,7 +308,11 @@ public final class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
 
-                if (isInternalWebViewUri(uri) || isLocalProxyUri(uri)) {
+                if (isLocalProxyAlbumUri(uri)) {
+                    return false;
+                }
+
+                if (isInternalWebViewUri(uri) && !request.isForMainFrame()) {
                     return false;
                 }
 
@@ -322,14 +326,16 @@ public final class MainActivity extends Activity {
 
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                if (isInternalWebViewUri(request.getUrl()) || isLocalProxyUri(request.getUrl())) {
+                Uri uri = request.getUrl();
+
+                if (isLocalProxyAlbumUri(uri) || (isInternalWebViewUri(uri) && !request.isForMainFrame())) {
                     return super.shouldInterceptRequest(view, request);
                 }
 
                 Log.w(
                     LOG_TAG,
                     "Blocked external WebView request: "
-                        + request.getUrl()
+                        + uri
                         + ", mainFrame="
                         + request.isForMainFrame()
                 );
@@ -391,14 +397,19 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Checks whether a URI points to the local album proxy.
+     * Checks whether a URI points to the exact local proxy album root.
      *
      * @param uri URI requested by WebView.
-     * @return true when the URI uses the local proxy host.
+     * @return true when the URI belongs to the current local proxy album URL.
      */
-    private boolean isLocalProxyUri(Uri uri) {
-        String host = uri.getHost();
-        return "127.0.0.1".equals(host) || "localhost".equals(host);
+    private boolean isLocalProxyAlbumUri(Uri uri) {
+        if (uri == null || localProxyAlbumRootUrl.isEmpty()) {
+            return false;
+        }
+
+        String uriText = uri.toString();
+        return uriText.equals(localProxyAlbumRootUrl.substring(0, localProxyAlbumRootUrl.length() - 1))
+            || uriText.startsWith(localProxyAlbumRootUrl);
     }
 
     /**

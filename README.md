@@ -5,7 +5,7 @@ Minimalist Android viewer for fixed RPlayer IPFS album variants.
 Current variants:
 
 - `unexpectedTracks`: `https://ipfs.io/ipfs/bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm/index.htm`
-- `dreamer`: `https://ipfs.io/ipfs/bafybeifdc2rfwjxe7hdntvgkabir7ocbikbdamylhv7ojewtnrm3pdvbri/index.htm`
+- `dreamer`: `https://ipfs.io/ipfs/bafybeiaknjru5kws3exdyleahfleoh3ud3bp5ve7l3e7yeqmzo3sp7rcii/index.htm`
 - `krehkyMechanismus`: `https://ipfs.io/ipfs/bafybeigmjwx26qgubv6ddciwuwbatpgcdrw6mnhgz4qy5bd55nb3trosfu/index.htm`
 
 The viewer does not launch a general-purpose browser. Android WebView loads a local `127.0.0.1` address served by a small proxy. The proxy fetches data from `ipfs.io`, removes the gateway download behavior that prevents rendering, and fills MIME types by file extension.
@@ -45,7 +45,7 @@ The build command may need Android SDK and Java available on the host machine.
 Release APK files can be signed after a release build with one password prompt:
 
 ```sh
-scripts/sign-release-apks.sh 0.1.3-build-34
+scripts/sign-release-apks.sh 0.1.4-build-35
 ```
 
 The script uses `APKSIGNER`, `KEYSTORE`, and `KEY_ALIAS` environment variables when set. Otherwise it uses the local maintainer defaults.
