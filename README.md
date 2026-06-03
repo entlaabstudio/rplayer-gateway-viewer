@@ -1,8 +1,16 @@
 # RPlayer Gateway Viewer
 
-Minimalist Android viewer for fixed RPlayer IPFS album variants.
+Minimalist Android viewer for fixed RPlayer IPFS music album variants.
 
-Current variants:
+Current album builds:
+
+| Variant | Artist | Album | Year | Genres | APK |
+| --- | --- | --- | --- | --- | --- |
+| `unexpectedTracks` | Technotramp | Unexpected Tracks | 2023 | Techno-Tramping | `unexpectedTracks-0.1.4-build-35-release-signed.apk` |
+| `dreamer` | Michal Diviš | Dreamer | 2021 | Metal, Progressive rock, Djent | `dreamer-0.1.4-build-35-release-signed.apk` |
+| `krehkyMechanismus` | První Hoře | Křehký mechanismus pozemského štěstí | 2017 | Progressive rock, Metal, Alternative, Avantgarde | `krehkyMechanismus-0.1.4-build-35-release-signed.apk` |
+
+Current IPFS album roots:
 
 - `unexpectedTracks`: `https://ipfs.io/ipfs/bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm/index.htm`
 - `dreamer`: `https://ipfs.io/ipfs/bafybeiaknjru5kws3exdyleahfleoh3ud3bp5ve7l3e7yeqmzo3sp7rcii/index.htm`
