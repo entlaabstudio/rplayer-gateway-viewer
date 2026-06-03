@@ -31,6 +31,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -102,6 +103,7 @@ public final class MainActivity extends Activity {
     private long currentMediaDurationMs = -1;
     private int currentPlaybackState = PlaybackState.STATE_NONE;
     private boolean playbackForegroundServiceActive;
+    private Toast missingExternalAppToast;
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -177,6 +179,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         closeActiveDownloadSession();
+        cancelMissingExternalAppToast();
         stopPlaybackForegroundService();
         cancelMediaNotification();
 
@@ -294,18 +297,42 @@ public final class MainActivity extends Activity {
         webView.addJavascriptInterface(new DisplayModeBridge(), "RPlayerGatewayDisplayModeNative");
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient() {
+            /**
+             * Keeps album navigation inside WebView and opens user-selected web links externally.
+             *
+             * @param view WebView receiving the navigation request.
+             * @param request requested navigation target.
+             * @return true when the app handled or blocked the navigation.
+             */
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri uri = request.getUrl();
+
+                if (isInternalWebViewUri(uri) || isLocalProxyUri(uri)) {
+                    return false;
+                }
+
+                if (!request.isForMainFrame()) {
+                    Log.w(LOG_TAG, "Blocked external subresource request: " + uri);
+                    return true;
+                }
+
+                return openExternalWebLink(uri);
+            }
+
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                String scheme = request.getUrl().getScheme();
-                String host = request.getUrl().getHost();
-                boolean internalRequest = "data".equals(scheme) || "about".equals(scheme) || "blob".equals(scheme);
-                boolean localRequest = "127.0.0.1".equals(host) || "localhost".equals(host);
-
-                if (internalRequest || localRequest) {
+                if (isInternalWebViewUri(request.getUrl()) || isLocalProxyUri(request.getUrl())) {
                     return super.shouldInterceptRequest(view, request);
                 }
 
-                // The prototype does not allow external navigation outside the local proxy yet.
+                Log.w(
+                    LOG_TAG,
+                    "Blocked external WebView request: "
+                        + request.getUrl()
+                        + ", mainFrame="
+                        + request.isForMainFrame()
+                );
                 return blockedResponse();
             }
 
@@ -350,6 +377,89 @@ public final class MainActivity extends Activity {
                 injectDisplayModeBridge();
             }
         });
+    }
+
+    /**
+     * Checks whether a URI belongs to WebView's internal schemes.
+     *
+     * @param uri URI requested by WebView.
+     * @return true for internal data, about, and blob resources.
+     */
+    private boolean isInternalWebViewUri(Uri uri) {
+        String scheme = uri.getScheme();
+        return "data".equals(scheme) || "about".equals(scheme) || "blob".equals(scheme);
+    }
+
+    /**
+     * Checks whether a URI points to the local album proxy.
+     *
+     * @param uri URI requested by WebView.
+     * @return true when the URI uses the local proxy host.
+     */
+    private boolean isLocalProxyUri(Uri uri) {
+        String host = uri.getHost();
+        return "127.0.0.1".equals(host) || "localhost".equals(host);
+    }
+
+    /**
+     * Opens a user-selected web link in the Android system browser.
+     *
+     * @param uri external URI requested from the RPlayer page.
+     * @return true because external navigation is handled outside WebView.
+     */
+    private boolean openExternalWebLink(Uri uri) {
+        String scheme = uri.getScheme();
+        Intent intent;
+
+        if ("http".equals(scheme) || "https".equals(scheme)) {
+            intent = new Intent(Intent.ACTION_VIEW, uri);
+            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+        } else if ("mailto".equals(scheme)) {
+            intent = new Intent(Intent.ACTION_SENDTO, uri);
+        } else {
+            Log.w(LOG_TAG, "Blocked external link with unsupported scheme: " + uri);
+            return true;
+        }
+
+        try {
+            startActivity(intent);
+            Log.i(LOG_TAG, "Opened external link outside WebView: " + uri);
+        } catch (ActivityNotFoundException exception) {
+            Log.w(LOG_TAG, "No external app is available for link: " + uri, exception);
+            showMissingExternalAppMessage(scheme);
+        }
+
+        return true;
+    }
+
+    /**
+     * Tells the user when Android has no app for an allowed external link type.
+     *
+     * @param scheme URI scheme that could not be opened by Android.
+     */
+    private void showMissingExternalAppMessage(String scheme) {
+        String message = "mailto".equals(scheme)
+            ? "No e-mail app is available on this device."
+            : "No app is available to open this link.";
+
+        if (missingExternalAppToast != null) {
+            missingExternalAppToast.cancel();
+        }
+
+        missingExternalAppToast = Toast.makeText(this, message, Toast.LENGTH_LONG);
+        missingExternalAppToast.show();
+    }
+
+    /**
+     * Cancels a pending missing-app message when the Activity is going away.
+     */
+    private void cancelMissingExternalAppToast() {
+        if (missingExternalAppToast == null) {
+            return;
+        }
+
+        missingExternalAppToast.cancel();
+        missingExternalAppToast = null;
     }
 
     /**
@@ -1116,7 +1226,7 @@ public final class MainActivity extends Activity {
      * Returns a small plain-text response for navigation blocked by the WebView policy.
      */
     private WebResourceResponse blockedResponse() {
-        byte[] body = "External addresses are blocked in this prototype.".getBytes(StandardCharsets.UTF_8);
+        byte[] body = "External subresources are blocked by RPlayer Gateway Viewer.".getBytes(StandardCharsets.UTF_8);
         return new WebResourceResponse(
             "text/plain",
             "utf-8",

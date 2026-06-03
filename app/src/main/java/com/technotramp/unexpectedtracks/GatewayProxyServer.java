@@ -223,7 +223,7 @@ final class GatewayProxyServer implements Closeable {
         connection.setRequestMethod(request.method);
         connection.setConnectTimeout(15000);
         connection.setReadTimeout(30000);
-        connection.setRequestProperty("User-Agent", "RPlayer Gateway Viewer/0.1.0");
+        connection.setRequestProperty("User-Agent", "RPlayer Gateway Viewer/" + BuildConfig.VERSION_NAME);
 
         String range = request.headers.get("range");
         if (range != null && !range.isEmpty()) {

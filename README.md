@@ -16,7 +16,8 @@ The viewer does not launch a general-purpose browser. Android WebView loads a lo
 - The proxy handles `GET` and `HEAD`.
 - The proxy passes the `Range` header for audio seeking.
 - The proxy allows only paths under the configured variant IPFS album root.
-- External addresses outside the local proxy are blocked.
+- User-selected external `http`, `https`, and `mailto` links open outside WebView.
+- External subresources outside the local proxy are blocked.
 - The Android foreground playback service intentionally remains active while playback is paused for broader device compatibility. Some Android WebView builds may still suspend the audio pipeline after a longer pause.
 
 ## Build
@@ -38,3 +39,13 @@ Release builds use the same flavor names:
 ```
 
 The build command may need Android SDK and Java available on the host machine.
+
+## Signing
+
+Release APK files can be signed after a release build with one password prompt:
+
+```sh
+scripts/sign-release-apks.sh 0.1.3-build-34
+```
+
+The script uses `APKSIGNER`, `KEYSTORE`, and `KEY_ALIAS` environment variables when set. Otherwise it uses the local maintainer defaults.
