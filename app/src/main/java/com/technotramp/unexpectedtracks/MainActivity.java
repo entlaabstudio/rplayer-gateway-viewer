@@ -31,6 +31,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -60,13 +61,13 @@ public final class MainActivity extends Activity {
     private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
     private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "music_player";
-    private static final String DEFAULT_MEDIA_TITLE = "Unexpected Tracks";
-    private static final String DEFAULT_MEDIA_ARTIST = "Technotramp";
-    private static final String DEFAULT_MEDIA_ALBUM = "Unexpected Tracks";
-    private static final String ACTION_MEDIA_PREVIOUS = "com.technotramp.unexpectedtracks.action.MEDIA_PREVIOUS";
-    private static final String ACTION_MEDIA_PLAY_PAUSE = "com.technotramp.unexpectedtracks.action.MEDIA_PLAY_PAUSE";
-    private static final String ACTION_MEDIA_NEXT = "com.technotramp.unexpectedtracks.action.MEDIA_NEXT";
-    private static final String EXTRA_MEDIA_ACTION_TOKEN = "com.technotramp.unexpectedtracks.extra.MEDIA_ACTION_TOKEN";
+    private static final String DEFAULT_MEDIA_TITLE = BuildConfig.DEFAULT_MEDIA_TITLE;
+    private static final String DEFAULT_MEDIA_ARTIST = BuildConfig.DEFAULT_MEDIA_ARTIST;
+    private static final String DEFAULT_MEDIA_ALBUM = BuildConfig.DEFAULT_MEDIA_ALBUM;
+    private static final String ACTION_MEDIA_PREVIOUS = BuildConfig.APPLICATION_ID + ".action.MEDIA_PREVIOUS";
+    private static final String ACTION_MEDIA_PLAY_PAUSE = BuildConfig.APPLICATION_ID + ".action.MEDIA_PLAY_PAUSE";
+    private static final String ACTION_MEDIA_NEXT = BuildConfig.APPLICATION_ID + ".action.MEDIA_NEXT";
+    private static final String EXTRA_MEDIA_ACTION_TOKEN = BuildConfig.APPLICATION_ID + ".extra.MEDIA_ACTION_TOKEN";
     private static final int MEDIA_PREVIOUS_REQUEST_CODE = 2002;
     private static final int MEDIA_PLAY_PAUSE_REQUEST_CODE = 2003;
     private static final int MEDIA_NEXT_REQUEST_CODE = 2004;
@@ -102,6 +103,7 @@ public final class MainActivity extends Activity {
     private long currentMediaDurationMs = -1;
     private int currentPlaybackState = PlaybackState.STATE_NONE;
     private boolean playbackForegroundServiceActive;
+    private Toast missingExternalAppToast;
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -177,6 +179,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         closeActiveDownloadSession();
+        cancelMissingExternalAppToast();
         stopPlaybackForegroundService();
         cancelMediaNotification();
 
@@ -294,18 +297,48 @@ public final class MainActivity extends Activity {
         webView.addJavascriptInterface(new DisplayModeBridge(), "RPlayerGatewayDisplayModeNative");
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient() {
+            /**
+             * Keeps album navigation inside WebView and opens user-selected web links externally.
+             *
+             * @param view WebView receiving the navigation request.
+             * @param request requested navigation target.
+             * @return true when the app handled or blocked the navigation.
+             */
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri uri = request.getUrl();
+
+                if (isLocalProxyAlbumUri(uri)) {
+                    return false;
+                }
+
+                if (isInternalWebViewUri(uri) && !request.isForMainFrame()) {
+                    return false;
+                }
+
+                if (!request.isForMainFrame()) {
+                    Log.w(LOG_TAG, "Blocked external subresource request: " + uri);
+                    return true;
+                }
+
+                return openExternalWebLink(uri);
+            }
+
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                String scheme = request.getUrl().getScheme();
-                String host = request.getUrl().getHost();
-                boolean internalRequest = "data".equals(scheme) || "about".equals(scheme) || "blob".equals(scheme);
-                boolean localRequest = "127.0.0.1".equals(host) || "localhost".equals(host);
+                Uri uri = request.getUrl();
 
-                if (internalRequest || localRequest) {
+                if (isLocalProxyAlbumUri(uri) || (isInternalWebViewUri(uri) && !request.isForMainFrame())) {
                     return super.shouldInterceptRequest(view, request);
                 }
 
-                // The prototype does not allow external navigation outside the local proxy yet.
+                Log.w(
+                    LOG_TAG,
+                    "Blocked external WebView request: "
+                        + uri
+                        + ", mainFrame="
+                        + request.isForMainFrame()
+                );
                 return blockedResponse();
             }
 
@@ -350,6 +383,94 @@ public final class MainActivity extends Activity {
                 injectDisplayModeBridge();
             }
         });
+    }
+
+    /**
+     * Checks whether a URI belongs to WebView's internal schemes.
+     *
+     * @param uri URI requested by WebView.
+     * @return true for internal data, about, and blob resources.
+     */
+    private boolean isInternalWebViewUri(Uri uri) {
+        String scheme = uri.getScheme();
+        return "data".equals(scheme) || "about".equals(scheme) || "blob".equals(scheme);
+    }
+
+    /**
+     * Checks whether a URI points to the exact local proxy album root.
+     *
+     * @param uri URI requested by WebView.
+     * @return true when the URI belongs to the current local proxy album URL.
+     */
+    private boolean isLocalProxyAlbumUri(Uri uri) {
+        if (uri == null || localProxyAlbumRootUrl.isEmpty()) {
+            return false;
+        }
+
+        String uriText = uri.toString();
+        return uriText.equals(localProxyAlbumRootUrl.substring(0, localProxyAlbumRootUrl.length() - 1))
+            || uriText.startsWith(localProxyAlbumRootUrl);
+    }
+
+    /**
+     * Opens a user-selected web link in the Android system browser.
+     *
+     * @param uri external URI requested from the RPlayer page.
+     * @return true because external navigation is handled outside WebView.
+     */
+    private boolean openExternalWebLink(Uri uri) {
+        String scheme = uri.getScheme();
+        Intent intent;
+
+        if ("http".equals(scheme) || "https".equals(scheme)) {
+            intent = new Intent(Intent.ACTION_VIEW, uri);
+            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+        } else if ("mailto".equals(scheme)) {
+            intent = new Intent(Intent.ACTION_SENDTO, uri);
+        } else {
+            Log.w(LOG_TAG, "Blocked external link with unsupported scheme: " + uri);
+            return true;
+        }
+
+        try {
+            startActivity(intent);
+            Log.i(LOG_TAG, "Opened external link outside WebView: " + uri);
+        } catch (ActivityNotFoundException exception) {
+            Log.w(LOG_TAG, "No external app is available for link: " + uri, exception);
+            showMissingExternalAppMessage(scheme);
+        }
+
+        return true;
+    }
+
+    /**
+     * Tells the user when Android has no app for an allowed external link type.
+     *
+     * @param scheme URI scheme that could not be opened by Android.
+     */
+    private void showMissingExternalAppMessage(String scheme) {
+        String message = "mailto".equals(scheme)
+            ? "No e-mail app is available on this device."
+            : "No app is available to open this link.";
+
+        if (missingExternalAppToast != null) {
+            missingExternalAppToast.cancel();
+        }
+
+        missingExternalAppToast = Toast.makeText(this, message, Toast.LENGTH_LONG);
+        missingExternalAppToast.show();
+    }
+
+    /**
+     * Cancels a pending missing-app message when the Activity is going away.
+     */
+    private void cancelMissingExternalAppToast() {
+        if (missingExternalAppToast == null) {
+            return;
+        }
+
+        missingExternalAppToast.cancel();
+        missingExternalAppToast = null;
     }
 
     /**
@@ -1116,7 +1237,7 @@ public final class MainActivity extends Activity {
      * Returns a small plain-text response for navigation blocked by the WebView policy.
      */
     private WebResourceResponse blockedResponse() {
-        byte[] body = "External addresses are blocked in this prototype.".getBytes(StandardCharsets.UTF_8);
+        byte[] body = "External subresources are blocked by RPlayer Gateway Viewer.".getBytes(StandardCharsets.UTF_8);
         return new WebResourceResponse(
             "text/plain",
             "utf-8",
@@ -1219,12 +1340,12 @@ public final class MainActivity extends Activity {
      */
     private static String sanitizeFileName(String fileName) {
         if (fileName == null) {
-            return "unexpected-tracks.zip";
+            return BuildConfig.DEFAULT_DOWNLOAD_FILE_NAME;
         }
 
         String cleanName = fileName.trim().replace('"', '_').replaceAll("[\\\\/:*?<>|]", "_");
         if (cleanName.isEmpty()) {
-            return "unexpected-tracks.zip";
+            return BuildConfig.DEFAULT_DOWNLOAD_FILE_NAME;
         }
 
         return cleanName;

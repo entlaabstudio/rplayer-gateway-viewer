@@ -6,17 +6,56 @@ android {
     namespace "com.technotramp.unexpectedtracks"
     compileSdk 35
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId "com.technotramp.unexpectedtracks"
         minSdk 23
         targetSdk 35
-        versionCode 31
-        versionName "0.1.0"
+        versionCode 35
+        versionName "0.1.4"
+    }
+
+    flavorDimensions "album"
+
+    productFlavors {
+        unexpectedTracks {
+            dimension "album"
+            applicationId "com.technotramp.unexpectedtracks"
+            buildConfigField "String", "IPFS_CID", "\"bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm\""
+            buildConfigField "String", "DEFAULT_MEDIA_TITLE", "\"Unexpected Tracks\""
+            buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"Technotramp\""
+            buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Unexpected Tracks\""
+            buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"unexpected-tracks.zip\""
+        }
+
+        dreamer {
+            dimension "album"
+            applicationId "com.michaldivis.dreamer"
+            buildConfigField "String", "IPFS_CID", "\"bafybeiaknjru5kws3exdyleahfleoh3ud3bp5ve7l3e7yeqmzo3sp7rcii\""
+            buildConfigField "String", "DEFAULT_MEDIA_TITLE", "\"Dreamer\""
+            buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"Michal Diviš\""
+            buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Dreamer\""
+            buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"dreamer.zip\""
+        }
+
+        krehkyMechanismus {
+            dimension "album"
+            applicationId "cz.prvnihore.krehkymechanismus"
+            buildConfigField "String", "IPFS_CID", "\"bafybeigmjwx26qgubv6ddciwuwbatpgcdrw6mnhgz4qy5bd55nb3trosfu\""
+            buildConfigField "String", "DEFAULT_MEDIA_TITLE", "\"Křehký mechanismus pozemského štěstí\""
+            buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"První hoře\""
+            buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Křehký mechanismus pozemského štěstí\""
+            buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"krehky-mechanismus.zip\""
+        }
     }
 
     applicationVariants.all { variant ->
         variant.outputs.all { output ->
-            outputFileName = "unexpected-tracks-${variant.versionName}-build-${variant.versionCode}-${variant.name}.apk"
+            String flavorName = variant.productFlavors[0].name
+            outputFileName = "${flavorName}-${variant.versionName}-build-${variant.versionCode}-${variant.name}.apk"
         }
     }
 }

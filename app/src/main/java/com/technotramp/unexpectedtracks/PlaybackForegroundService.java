@@ -12,8 +12,8 @@ import android.util.Log;
  * Keeps Android aware that RPlayer is actively playing media in the background.
  */
 public class PlaybackForegroundService extends Service {
-    public static final String ACTION_START = "com.technotramp.unexpectedtracks.action.START_PLAYBACK_FOREGROUND";
-    public static final String ACTION_STOP = "com.technotramp.unexpectedtracks.action.STOP_PLAYBACK_FOREGROUND";
+    public static final String ACTION_START = BuildConfig.APPLICATION_ID + ".action.START_PLAYBACK_FOREGROUND";
+    public static final String ACTION_STOP = BuildConfig.APPLICATION_ID + ".action.STOP_PLAYBACK_FOREGROUND";
 
     private static final String LOG_TAG = "RPlayerForeground";
     private static final int PLAYBACK_NOTIFICATION_ID = 2001;
@@ -71,8 +71,8 @@ public class PlaybackForegroundService extends Service {
     private Notification createFallbackNotification() {
         Notification.Builder builder = notificationBuilder()
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Unexpected Tracks")
-            .setContentText("Technotramp")
+            .setContentTitle(BuildConfig.DEFAULT_MEDIA_TITLE)
+            .setContentText(BuildConfig.DEFAULT_MEDIA_ARTIST)
             .setContentIntent(createContentIntent())
             .setCategory(Notification.CATEGORY_TRANSPORT)
             .setVisibility(Notification.VISIBILITY_PUBLIC)

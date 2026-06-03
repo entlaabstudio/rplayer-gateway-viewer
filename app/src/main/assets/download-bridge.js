@@ -22,7 +22,7 @@
      */
     function sendBlobToAndroid(blob, fileName) {
         var downloadId = String(Date.now()) + '-' + Math.random().toString(16).slice(2);
-        var safeName = fileName || 'unexpected-tracks.zip';
+        var safeName = fileName || 'rplayer-download.zip';
         var mimeType = blob.type || 'application/zip';
         var offset = 0;
         var chunkIndex = 0;
