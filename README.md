@@ -16,6 +16,18 @@ Current IPFS album roots:
 - `dreamer`: `https://ipfs.io/ipfs/bafybeiaknjru5kws3exdyleahfleoh3ud3bp5ve7l3e7yeqmzo3sp7rcii/index.htm`
 - `krehkyMechanismus`: `https://ipfs.io/ipfs/bafybeigmjwx26qgubv6ddciwuwbatpgcdrw6mnhgz4qy5bd55nb3trosfu/index.htm`
 
+Current release APK IPFS mirrors:
+
+- `unexpectedTracks-0.1.4-build-35-release-signed.apk`: `https://bafybeifvc7lpluy35rpmxr427te66xnnhonb4yf36gjdaigezauqprywcq.ipfs.dweb.link?filename=unexpectedTracks-0.1.4-build-35-release-signed.apk`
+- `dreamer-0.1.4-build-35-release-signed.apk`: `https://bafybeifg5isuchtxxfthyro2zfeabxjjjjfhhau3qqatedfxnr6ojj6uuq.ipfs.dweb.link?filename=dreamer-0.1.4-build-35-release-signed.apk`
+- `krehkyMechanismus-0.1.4-build-35-release-signed.apk`: `https://bafybeieax5iqfo6ivvpps6bd6pb3fvsdlcowu4si3ekmbyrttk6jpdevlm.ipfs.dweb.link?filename=krehkyMechanismus-0.1.4-build-35-release-signed.apk`
+
+VirusTotal checks for the release APK files reported `0/66` security vendors flagging the files as malicious:
+
+- `unexpectedTracks-0.1.4-build-35-release-signed.apk`: `https://www.virustotal.com/gui/file/33355b38eb97ede0cdd237a04c050052f3e34449ed81d9102dfa66f68b2077eb`
+- `dreamer-0.1.4-build-35-release-signed.apk`: `https://www.virustotal.com/gui/file/adb6a1ee6d2317b1d1229c49a5620ea760a7b08b3d2ac7c30b1ce7177e272e9c`
+- `krehkyMechanismus-0.1.4-build-35-release-signed.apk`: `https://www.virustotal.com/gui/file/6110a145a841a1ffcc397f7b7fc262ed0f721355a9972e1900ab448221b19260`
+
 The viewer does not launch a general-purpose browser. Android WebView loads a local `127.0.0.1` address served by a small proxy. The proxy fetches data from `ipfs.io`, removes the gateway download behavior that prevents rendering, and fills MIME types by file extension.
 
 ## Status
