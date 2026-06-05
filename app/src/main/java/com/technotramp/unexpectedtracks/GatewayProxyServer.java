@@ -1,5 +1,6 @@
 package com.technotramp.unexpectedtracks;
 
+import android.graphics.BitmapFactory;
 import android.util.Log;
 
 import java.io.BufferedInputStream;
@@ -25,6 +26,8 @@ import java.security.NoSuchAlgorithmException;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -44,9 +47,12 @@ final class GatewayProxyServer implements Closeable {
     private static final String ROOT_PATH = IPFS_ROOT_PATH + ENTRY_FILE;
     private static final int BUFFER_SIZE = 32 * 1024;
     private static final long SLOW_REQUEST_LOG_THRESHOLD_MS = 5000;
+    private static final long CACHE_REPAIR_RETRY_DELAY_MS = 5000;
+    private static final int CACHE_REPAIR_MAX_ATTEMPTS = 6;
     private static final String CACHE_CONTROL_VALUE = "public, max-age=31536000, immutable";
 
     private final ExecutorService executorService = Executors.newCachedThreadPool();
+    private final Set<String> cacheRepairPaths = ConcurrentHashMap.newKeySet();
     private final String htmlBridgeScript;
     private final File cacheDirectory;
     private ServerSocket serverSocket;
@@ -278,7 +284,7 @@ final class GatewayProxyServer implements Closeable {
 
         if (!"HEAD".equals(request.method) && shouldInjectHtmlBridge(request, statusCode, contentType)) {
             byte[] originalHtmlBody = readStreamBytes(responseStream);
-            storeCompleteResponse(request, originalHtmlBody, statusCode, contentType, connection.getHeaderField("Last-Modified"), connection.getHeaderField("ETag"));
+            storeCompleteResponse(request, originalHtmlBody, statusCode, contentType, cacheHeadersFrom(connection));
             String html = new String(originalHtmlBody, StandardCharsets.UTF_8);
             injectedResponseBody = injectHtmlBridge(html).getBytes(StandardCharsets.UTF_8);
             responseStream = new ByteArrayInputStream(injectedResponseBody);
@@ -294,8 +300,9 @@ final class GatewayProxyServer implements Closeable {
             ? connection.getHeaderField("Content-Length")
             : String.valueOf(injectedResponseBody.length);
         String contentRange = connection.getHeaderField("Content-Range");
-        String lastModified = connection.getHeaderField("Last-Modified");
-        String etag = connection.getHeaderField("ETag");
+        CacheResponseHeaders cacheHeaders = cacheHeadersFrom(connection);
+        String lastModified = cacheHeaders.lastModified;
+        String etag = cacheHeaders.etag;
 
         if (contentLength != null) {
             writeHeader(outputStream, "Content-Length", contentLength);
@@ -313,10 +320,18 @@ final class GatewayProxyServer implements Closeable {
             writeHeader(outputStream, "ETag", etag);
         }
 
+        if (!cacheHeaders.ipfsPath.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Path", cacheHeaders.ipfsPath);
+        }
+
+        if (!cacheHeaders.ipfsRoots.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Roots", cacheHeaders.ipfsRoots);
+        }
+
         outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
 
         if (!"HEAD".equals(request.method)) {
-            long bytesWritten = copyGatewayBody(request, responseStream, outputStream, statusCode, contentType, lastModified, etag, injectedResponseBody);
+            long bytesWritten = copyGatewayBody(request, responseStream, outputStream, statusCode, contentType, cacheHeaders, injectedResponseBody);
             outputStream.flush();
             closeQuietly(responseStream);
             return bytesWritten;
@@ -366,6 +381,13 @@ final class GatewayProxyServer implements Closeable {
             return false;
         }
 
+        if (!isCacheEntryValid(cacheEntry, metadata)) {
+            Log.w(LOG_TAG, "Persistent cache invalid, refetching: " + request.path);
+            deleteCacheEntry(cacheEntry);
+            scheduleCacheRepair(request.path, "invalid cache hit");
+            return false;
+        }
+
         Log.i(LOG_TAG, "Persistent cache hit: " + request.path);
         writeCachedResponse(socket, request, cacheEntry.dataFile, metadata);
         return true;
@@ -409,6 +431,14 @@ final class GatewayProxyServer implements Closeable {
             writeHeader(outputStream, "ETag", metadata.etag);
         }
 
+        if (!metadata.ipfsPath.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Path", metadata.ipfsPath);
+        }
+
+        if (!metadata.ipfsRoots.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Roots", metadata.ipfsRoots);
+        }
+
         outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
         copyStream(inputStream, outputStream);
         outputStream.flush();
@@ -423,8 +453,7 @@ final class GatewayProxyServer implements Closeable {
      * @param outputStream target WebView response stream
      * @param statusCode gateway HTTP status code
      * @param contentType resolved MIME type sent to WebView
-     * @param lastModified gateway Last-Modified header, if any
-     * @param etag gateway ETag header, if any
+     * @param cacheHeaders gateway headers useful for persistent cache validation
      * @param injectedBody HTML body already modified for bridge injection, if any
      * @return number of bytes written to WebView
      * @throws IOException when streaming fails
@@ -435,8 +464,7 @@ final class GatewayProxyServer implements Closeable {
         BufferedOutputStream outputStream,
         int statusCode,
         String contentType,
-        String lastModified,
-        String etag,
+        CacheResponseHeaders cacheHeaders,
         byte[] injectedBody
     ) throws IOException {
         if (!isCompleteCacheRequest(request) || statusCode != 200) {
@@ -444,16 +472,16 @@ final class GatewayProxyServer implements Closeable {
         }
 
         CacheEntry cacheEntry = cacheEntryFor(request.path);
-        File tempFile = new File(cacheDirectory, cacheEntry.key + ".tmp");
+        File tempFile = temporaryCacheFile(cacheEntry, "download");
         long bytesWritten;
 
         if (injectedBody != null) {
             return copyStream(inputStream, outputStream);
         }
 
-        bytesWritten = copyStreamToOutputAndFile(inputStream, outputStream, tempFile);
-        finishCacheWrite(cacheEntry, tempFile, contentType, lastModified, etag, bytesWritten);
-        return bytesWritten;
+        CopyResult copyResult = copyStreamToOutputAndFile(inputStream, outputStream, tempFile);
+        finishCacheWrite(cacheEntry, tempFile, contentType, cacheHeaders, copyResult, true);
+        return copyResult.bytesCopied;
     }
 
     /**
@@ -463,23 +491,22 @@ final class GatewayProxyServer implements Closeable {
      * @param body original gateway response body before viewer bridge injection
      * @param statusCode gateway HTTP status code
      * @param contentType resolved MIME type sent to WebView
-     * @param lastModified gateway Last-Modified header, if any
-     * @param etag gateway ETag header, if any
+     * @param cacheHeaders gateway headers useful for persistent cache validation
      */
-    private void storeCompleteResponse(HttpRequest request, byte[] body, int statusCode, String contentType, String lastModified, String etag) {
+    private void storeCompleteResponse(HttpRequest request, byte[] body, int statusCode, String contentType, CacheResponseHeaders cacheHeaders) {
         if (!isCompleteCacheRequest(request) || statusCode != 200) {
             return;
         }
 
         try {
             CacheEntry cacheEntry = cacheEntryFor(request.path);
-            File tempFile = new File(cacheDirectory, cacheEntry.key + ".tmp");
+            File tempFile = temporaryCacheFile(cacheEntry, "download");
 
             try (FileOutputStream outputStream = new FileOutputStream(tempFile)) {
                 outputStream.write(body);
             }
 
-            finishCacheWrite(cacheEntry, tempFile, contentType, lastModified, etag, body.length);
+            finishCacheWrite(cacheEntry, tempFile, contentType, cacheHeaders, new CopyResult(body.length, sha256(body)), true);
         } catch (IOException exception) {
             Log.w(LOG_TAG, "Persistent cache could not store response: " + request.path, exception);
         }
@@ -494,49 +521,319 @@ final class GatewayProxyServer implements Closeable {
      * @return number of bytes copied
      * @throws IOException when reading or writing fails
      */
-    private long copyStreamToOutputAndFile(InputStream inputStream, BufferedOutputStream outputStream, File file) throws IOException {
+    private CopyResult copyStreamToOutputAndFile(InputStream inputStream, BufferedOutputStream outputStream, File file) throws IOException {
         BufferedInputStream bufferedInputStream = new BufferedInputStream(inputStream);
         byte[] buffer = new byte[BUFFER_SIZE];
         long totalBytes = 0;
         int read;
 
         try (FileOutputStream fileOutputStream = new FileOutputStream(file)) {
+            MessageDigest digest = newSha256Digest();
+
             while ((read = bufferedInputStream.read(buffer)) >= 0) {
                 outputStream.write(buffer, 0, read);
                 fileOutputStream.write(buffer, 0, read);
+                digest.update(buffer, 0, read);
                 totalBytes += read;
             }
-        }
 
-        return totalBytes;
+            return new CopyResult(totalBytes, hex(digest.digest()));
+        }
     }
 
     /**
-     * Promotes a temporary cache body and writes its metadata.
+     * Promotes a validated temporary cache body and writes its metadata.
      *
      * @param cacheEntry target cache files
      * @param tempFile temporary body file
      * @param contentType resolved MIME type sent to WebView
-     * @param lastModified gateway Last-Modified header, if any
-     * @param etag gateway ETag header, if any
-     * @param contentLength complete response body length
+     * @param cacheHeaders gateway headers useful for persistent cache validation
+     * @param copyResult copied body length and local SHA-256
+     * @param repairOnFailure true when invalid candidates should start a background repair
      * @throws IOException when cache files cannot be written
      */
-    private void finishCacheWrite(CacheEntry cacheEntry, File tempFile, String contentType, String lastModified, String etag, long contentLength) throws IOException {
+    private void finishCacheWrite(
+        CacheEntry cacheEntry,
+        File tempFile,
+        String contentType,
+        CacheResponseHeaders cacheHeaders,
+        CopyResult copyResult,
+        boolean repairOnFailure
+    ) throws IOException {
+        CacheMetadata metadata = new CacheMetadata(contentType, cacheHeaders, copyResult.bytesCopied, copyResult.sha256);
+
+        if (!isCacheCandidateValid(tempFile, metadata)) {
+            Log.w(LOG_TAG, "Persistent cache candidate rejected: " + cacheEntry.key + ", bytes=" + copyResult.bytesCopied);
+            deleteFileQuietly(tempFile);
+            if (repairOnFailure) {
+                scheduleCacheRepair(cacheHeaders.ipfsPath, "invalid downloaded candidate");
+            }
+            return;
+        }
+
         if (cacheEntry.dataFile.exists() && !cacheEntry.dataFile.delete()) {
             Log.w(LOG_TAG, "Persistent cache old file could not be replaced: " + cacheEntry.dataFile.getAbsolutePath());
         }
 
         if (!tempFile.renameTo(cacheEntry.dataFile)) {
-            if (!tempFile.delete()) {
-                Log.w(LOG_TAG, "Persistent cache temporary file could not be removed: " + tempFile.getAbsolutePath());
-            }
+            deleteFileQuietly(tempFile);
             return;
         }
 
-        CacheMetadata metadata = new CacheMetadata(contentType, lastModified, etag, contentLength);
         metadata.save(cacheEntry.metaFile);
-        Log.i(LOG_TAG, "Persistent cache stored: " + cacheEntry.dataFile.getName() + ", bytes=" + contentLength);
+        Log.i(
+            LOG_TAG,
+            "Persistent cache stored: "
+                + cacheEntry.dataFile.getName()
+                + ", bytes=" + copyResult.bytesCopied
+                + ", etag=" + metadata.etag
+        );
+    }
+
+    /**
+     * Checks whether a downloaded cache candidate is complete and locally usable.
+     *
+     * @param dataFile temporary body file
+     * @param metadata metadata collected from the gateway and local copy
+     * @return true when the candidate can be promoted into persistent cache
+     */
+    private boolean isCacheCandidateValid(File dataFile, CacheMetadata metadata) {
+        if (!dataFile.isFile() || metadata.actualContentLength != dataFile.length()) {
+            return false;
+        }
+
+        if (metadata.expectedContentLength >= 0 && metadata.expectedContentLength != dataFile.length()) {
+            return false;
+        }
+
+        if (metadata.sha256.isEmpty() || !hasUsableIpfsIdentity(metadata)) {
+            return false;
+        }
+
+        return !isImageContent(metadata.contentType) || canDecodeImage(dataFile);
+    }
+
+    /**
+     * Checks whether a stored cache entry still matches its local metadata.
+     *
+     * @param cacheEntry cache files to validate
+     * @param metadata metadata loaded from disk
+     * @return true when the cached response can be served without refetching
+     */
+    private boolean isCacheEntryValid(CacheEntry cacheEntry, CacheMetadata metadata) {
+        if (!isCacheCandidateValid(cacheEntry.dataFile, metadata)) {
+            return false;
+        }
+
+        try {
+            return metadata.sha256.equals(sha256(cacheEntry.dataFile));
+        } catch (IOException exception) {
+            Log.w(LOG_TAG, "Persistent cache SHA-256 check failed: " + cacheEntry.dataFile.getName(), exception);
+            return false;
+        }
+    }
+
+    /**
+     * Schedules a conservative background retry for a stale cache entry.
+     *
+     * @param ipfsPath gateway IPFS path to refetch
+     * @param reason diagnostic reason written to Android logs
+     */
+    private void scheduleCacheRepair(String ipfsPath, String reason) {
+        if (ipfsPath == null || ipfsPath.trim().isEmpty() || !isSafeAlbumPath(ipfsPath)) {
+            return;
+        }
+
+        if (!cacheRepairPaths.add(ipfsPath)) {
+            return;
+        }
+
+        executorService.execute(() -> {
+            try {
+                for (int attempt = 1; running && attempt <= CACHE_REPAIR_MAX_ATTEMPTS; attempt++) {
+                    sleepBeforeRepairAttempt(attempt);
+                    if (!running) {
+                        return;
+                    }
+
+                    Log.i(LOG_TAG, "Persistent cache repair attempt " + attempt + ": " + ipfsPath + ", reason=" + reason);
+                    if (repairCacheEntry(ipfsPath)) {
+                        Log.i(LOG_TAG, "Persistent cache repair finished: " + ipfsPath);
+                        return;
+                    }
+                }
+
+                Log.w(LOG_TAG, "Persistent cache repair gave up: " + ipfsPath);
+            } finally {
+                cacheRepairPaths.remove(ipfsPath);
+            }
+        });
+    }
+
+    /**
+     * Waits before retrying a stale cache entry so gateway traffic stays modest.
+     */
+    private static void sleepBeforeRepairAttempt(int attempt) {
+        try {
+            Thread.sleep(CACHE_REPAIR_RETRY_DELAY_MS * attempt);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Downloads one complete response for cache repair without writing to WebView.
+     *
+     * @param ipfsPath safe IPFS path under the configured album root
+     * @return true when the cache entry was repaired
+     */
+    private boolean repairCacheEntry(String ipfsPath) {
+        HttpURLConnection connection = null;
+        InputStream responseStream = null;
+        File tempFile = null;
+
+        try {
+            URL gatewayUrl = new URL(GATEWAY_ORIGIN + ipfsPath);
+            connection = (HttpURLConnection) gatewayUrl.openConnection();
+            connection.setInstanceFollowRedirects(true);
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(30000);
+            connection.setRequestProperty("User-Agent", "RPlayer Gateway Viewer/" + BuildConfig.VERSION_NAME);
+
+            if (connection.getResponseCode() != 200) {
+                return false;
+            }
+
+            responseStream = connection.getInputStream();
+            CacheEntry cacheEntry = cacheEntryFor(ipfsPath);
+            tempFile = temporaryCacheFile(cacheEntry, "repair");
+            CopyResult copyResult = copyStreamToFile(responseStream, tempFile);
+            finishCacheWrite(cacheEntry, tempFile, MimeTypes.fromPath(ipfsPath, connection.getContentType()), cacheHeadersFrom(connection), copyResult, false);
+            return cacheEntry.dataFile.isFile();
+        } catch (IOException exception) {
+            Log.w(LOG_TAG, "Persistent cache repair failed: " + ipfsPath, exception);
+            deleteFileQuietly(tempFile);
+            return false;
+        } finally {
+            closeQuietly(responseStream);
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /**
+     * Copies a stream to a file while calculating local SHA-256.
+     */
+    private CopyResult copyStreamToFile(InputStream inputStream, File file) throws IOException {
+        BufferedInputStream bufferedInputStream = new BufferedInputStream(inputStream);
+        byte[] buffer = new byte[BUFFER_SIZE];
+        long totalBytes = 0;
+        int read;
+
+        try (FileOutputStream fileOutputStream = new FileOutputStream(file)) {
+            MessageDigest digest = newSha256Digest();
+
+            while ((read = bufferedInputStream.read(buffer)) >= 0) {
+                fileOutputStream.write(buffer, 0, read);
+                digest.update(buffer, 0, read);
+                totalBytes += read;
+            }
+
+            return new CopyResult(totalBytes, hex(digest.digest()));
+        }
+    }
+
+    /**
+     * Reads cache-related response headers from one gateway response.
+     */
+    private static CacheResponseHeaders cacheHeadersFrom(HttpURLConnection connection) {
+        return new CacheResponseHeaders(
+            connection.getHeaderField("Last-Modified"),
+            connection.getHeaderField("ETag"),
+            connection.getHeaderField("X-Ipfs-Path"),
+            connection.getHeaderField("X-Ipfs-Roots"),
+            parseLongHeader(connection.getHeaderField("Content-Length"))
+        );
+    }
+
+    /**
+     * Checks whether gateway metadata contains a consistent expected IPFS identity.
+     */
+    private static boolean hasUsableIpfsIdentity(CacheMetadata metadata) {
+        String etagCid = normalizeGatewayCid(metadata.etag);
+        String rootsCid = lastIpfsRoot(metadata.ipfsRoots);
+
+        if (etagCid.isEmpty()) {
+            return !rootsCid.isEmpty();
+        }
+
+        return rootsCid.isEmpty() || etagCid.equals(rootsCid);
+    }
+
+    /**
+     * Normalizes a gateway CID value stored in ETag-like headers.
+     */
+    private static String normalizeGatewayCid(String value) {
+        String normalized = safeHeaderValue(value);
+
+        if (normalized.startsWith("W/")) {
+            normalized = normalized.substring(2).trim();
+        }
+
+        if (normalized.length() >= 2 && normalized.startsWith("\"") && normalized.endsWith("\"")) {
+            normalized = normalized.substring(1, normalized.length() - 1).trim();
+        }
+
+        return normalized;
+    }
+
+    /**
+     * Returns the final CID from X-Ipfs-Roots, which represents the requested asset.
+     */
+    private static String lastIpfsRoot(String ipfsRoots) {
+        String safeRoots = safeHeaderValue(ipfsRoots);
+        if (safeRoots.isEmpty()) {
+            return "";
+        }
+
+        String[] roots = safeRoots.split(",");
+        return roots.length == 0 ? "" : roots[roots.length - 1].trim();
+    }
+
+    /**
+     * Returns true when the MIME type should be decoded as an Android image.
+     */
+    private static boolean isImageContent(String contentType) {
+        return contentType != null && contentType.toLowerCase(Locale.ROOT).startsWith("image/");
+    }
+
+    /**
+     * Checks image headers without allocating the whole bitmap pixel buffer.
+     */
+    private static boolean canDecodeImage(File file) {
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        return options.outWidth > 0 && options.outHeight > 0;
+    }
+
+    /**
+     * Removes both body and metadata for a broken cache object.
+     */
+    private static void deleteCacheEntry(CacheEntry cacheEntry) {
+        deleteFileQuietly(cacheEntry.dataFile);
+        deleteFileQuietly(cacheEntry.metaFile);
+    }
+
+    /**
+     * Removes one file without throwing during cache cleanup.
+     */
+    private static void deleteFileQuietly(File file) {
+        if (file != null && file.exists() && !file.delete()) {
+            Log.w(LOG_TAG, "Persistent cache file could not be removed: " + file.getAbsolutePath());
+        }
     }
 
     /**
@@ -707,24 +1004,104 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * Builds a unique temporary file name for one cache write candidate.
+     *
+     * @param cacheEntry target cache entry
+     * @param purpose short diagnostic purpose for the temporary file name
+     * @return unique temporary file inside the persistent cache directory
+     */
+    private File temporaryCacheFile(CacheEntry cacheEntry, String purpose) {
+        String uniqueName = cacheEntry.key
+            + "."
+            + safeTemporaryNamePart(purpose)
+            + "."
+            + Thread.currentThread().getId()
+            + "."
+            + System.nanoTime()
+            + ".tmp";
+        return new File(cacheDirectory, uniqueName);
+    }
+
+    /**
+     * Keeps temporary cache file names boring and filesystem-safe.
+     */
+    private static String safeTemporaryNamePart(String value) {
+        String safeValue = value == null ? "cache" : value.toLowerCase(Locale.ROOT);
+        return safeValue.replaceAll("[^a-z0-9_-]", "_");
+    }
+
+    /**
      * Creates a lowercase SHA-256 cache key.
      *
      * @param value source value to hash
      * @return hexadecimal SHA-256 string
      */
     private static String sha256(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder builder = new StringBuilder(hash.length * 2);
+        MessageDigest digest = newSha256Digest();
+        return hex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
+    }
 
-            for (byte item : hash) {
-                builder.append(String.format(Locale.ROOT, "%02x", item & 0xff));
+    /**
+     * Calculates lowercase SHA-256 for a byte array.
+     */
+    private static String sha256(byte[] value) {
+        MessageDigest digest = newSha256Digest();
+        return hex(digest.digest(value));
+    }
+
+    /**
+     * Calculates lowercase SHA-256 for one local file.
+     */
+    private static String sha256(File file) throws IOException {
+        MessageDigest digest = newSha256Digest();
+        byte[] buffer = new byte[BUFFER_SIZE];
+        int read;
+
+        try (InputStream inputStream = new BufferedInputStream(new FileInputStream(file))) {
+            while ((read = inputStream.read(buffer)) >= 0) {
+                digest.update(buffer, 0, read);
             }
+        }
 
-            return builder.toString();
+        return hex(digest.digest());
+    }
+
+    /**
+     * Creates a SHA-256 digest or fails loudly on broken Android runtimes.
+     */
+    private static MessageDigest newSha256Digest() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
         } catch (NoSuchAlgorithmException exception) {
             throw new IllegalStateException("SHA-256 is not available.", exception);
+        }
+    }
+
+    /**
+     * Converts binary hash bytes into lowercase hexadecimal text.
+     */
+    private static String hex(byte[] hash) {
+        StringBuilder builder = new StringBuilder(hash.length * 2);
+
+        for (byte item : hash) {
+            builder.append(String.format(Locale.ROOT, "%02x", item & 0xff));
+        }
+
+        return builder.toString();
+    }
+
+    /**
+     * Parses a positive HTTP length header.
+     */
+    private static long parseLongHeader(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return -1;
+        }
+
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException exception) {
+            return -1;
         }
     }
 
@@ -796,28 +1173,92 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
-     * Minimal metadata needed to replay a complete cached HTTP response.
+     * Metadata collected from one gateway response for cache validation.
+     */
+    private static final class CacheResponseHeaders {
+        private final String lastModified;
+        private final String etag;
+        private final String ipfsPath;
+        private final String ipfsRoots;
+        private final long expectedContentLength;
+
+        private CacheResponseHeaders(String lastModified, String etag, String ipfsPath, String ipfsRoots, long expectedContentLength) {
+            this.lastModified = safeHeaderValue(lastModified);
+            this.etag = safeHeaderValue(etag);
+            this.ipfsPath = safeHeaderValue(ipfsPath);
+            this.ipfsRoots = safeHeaderValue(ipfsRoots);
+            this.expectedContentLength = expectedContentLength;
+        }
+    }
+
+    /**
+     * Local copy result used before a response is promoted into persistent cache.
+     */
+    private static final class CopyResult {
+        private final long bytesCopied;
+        private final String sha256;
+
+        private CopyResult(long bytesCopied, String sha256) {
+            this.bytesCopied = bytesCopied;
+            this.sha256 = safeHeaderValue(sha256);
+        }
+    }
+
+    /**
+     * Metadata needed to validate and replay a complete cached HTTP response.
      */
     private static final class CacheMetadata {
         private final String contentType;
         private final String lastModified;
         private final String etag;
-        private final long contentLength;
+        private final String ipfsPath;
+        private final String ipfsRoots;
+        private final long expectedContentLength;
+        private final long actualContentLength;
+        private final String sha256;
 
         /**
          * Creates immutable cache response metadata.
          *
          * @param contentType MIME type sent to WebView
-         * @param lastModified Last-Modified header value, if any
-         * @param etag ETag header value, if any
-         * @param contentLength complete cached body length
+         * @param cacheHeaders gateway headers useful for persistent cache validation
+         * @param actualContentLength actual cached body length
+         * @param sha256 local SHA-256 of cached body bytes
          */
-        private CacheMetadata(String contentType, String lastModified, String etag, long contentLength) {
+        private CacheMetadata(String contentType, CacheResponseHeaders cacheHeaders, long actualContentLength, String sha256) {
+            String safeContentType = safeHeaderValue(contentType);
+            this.contentType = safeContentType.isEmpty() ? "application/octet-stream" : safeContentType;
+            this.lastModified = cacheHeaders.lastModified;
+            this.etag = cacheHeaders.etag;
+            this.ipfsPath = cacheHeaders.ipfsPath;
+            this.ipfsRoots = cacheHeaders.ipfsRoots;
+            this.expectedContentLength = cacheHeaders.expectedContentLength;
+            this.actualContentLength = actualContentLength;
+            this.sha256 = safeHeaderValue(sha256);
+        }
+
+        /**
+         * Creates immutable cache response metadata loaded from disk.
+         */
+        private CacheMetadata(
+            String contentType,
+            String lastModified,
+            String etag,
+            String ipfsPath,
+            String ipfsRoots,
+            long expectedContentLength,
+            long actualContentLength,
+            String sha256
+        ) {
             String safeContentType = safeHeaderValue(contentType);
             this.contentType = safeContentType.isEmpty() ? "application/octet-stream" : safeContentType;
             this.lastModified = safeHeaderValue(lastModified);
             this.etag = safeHeaderValue(etag);
-            this.contentLength = contentLength;
+            this.ipfsPath = safeHeaderValue(ipfsPath);
+            this.ipfsRoots = safeHeaderValue(ipfsRoots);
+            this.expectedContentLength = expectedContentLength;
+            this.actualContentLength = actualContentLength;
+            this.sha256 = safeHeaderValue(sha256);
         }
 
         /**
@@ -832,11 +1273,29 @@ final class GatewayProxyServer implements Closeable {
             }
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
+                String version = reader.readLine();
+                if (!"cache-v2".equals(version)) {
+                    return null;
+                }
+
                 String contentType = reader.readLine();
                 String lastModified = reader.readLine();
                 String etag = reader.readLine();
-                String length = reader.readLine();
-                return new CacheMetadata(contentType, lastModified, etag, Long.parseLong(length));
+                String ipfsPath = reader.readLine();
+                String ipfsRoots = reader.readLine();
+                long expectedContentLength = Long.parseLong(reader.readLine());
+                long actualContentLength = Long.parseLong(reader.readLine());
+                String sha256 = reader.readLine();
+                return new CacheMetadata(
+                    contentType,
+                    lastModified,
+                    etag,
+                    ipfsPath,
+                    ipfsRoots,
+                    expectedContentLength,
+                    actualContentLength,
+                    sha256
+                );
             } catch (IOException | RuntimeException exception) {
                 return null;
             }
@@ -850,7 +1309,15 @@ final class GatewayProxyServer implements Closeable {
          */
         private void save(File file) throws IOException {
             try (FileOutputStream outputStream = new FileOutputStream(file)) {
-                String text = contentType + "\n" + lastModified + "\n" + etag + "\n" + contentLength + "\n";
+                String text = "cache-v2\n"
+                    + contentType + "\n"
+                    + lastModified + "\n"
+                    + etag + "\n"
+                    + ipfsPath + "\n"
+                    + ipfsRoots + "\n"
+                    + expectedContentLength + "\n"
+                    + actualContentLength + "\n"
+                    + sha256 + "\n";
                 outputStream.write(text.getBytes(StandardCharsets.UTF_8));
             }
         }
