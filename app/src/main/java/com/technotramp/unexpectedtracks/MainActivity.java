@@ -174,6 +174,17 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * Sends the viewer to the background when Android Back is pressed.
+     *
+     * <p>This mirrors the Home button behavior so playback can continue and the
+     * activity is not destroyed accidentally.</p>
+     */
+    @Override
+    public void onBackPressed() {
+        moveTaskToBack(true);
+    }
+
+    /**
      * Releases WebView, proxy, and temporary download resources when the activity is destroyed.
      */
     @Override
