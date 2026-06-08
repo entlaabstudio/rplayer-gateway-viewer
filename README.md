@@ -2,6 +2,8 @@
 
 Minimalist Android viewer for fixed RPlayer IPFS music album variants.
 
+**Note:** The first player load can take longer because the app has to fetch album files from the public IPFS gateway and fill the local cache. Later starts are usually much faster.
+
 Current IPFS album roots:
 
 | Flavor | Artist | Album | Year | Genres | IPFS entry |
