@@ -2,14 +2,6 @@
 
 Minimalist Android viewer for fixed RPlayer IPFS music album variants.
 
-Current album builds:
-
-| Variant | Artist | Album | Year | Genres | APK |
-| --- | --- | --- | --- | --- | --- |
-| `unexpectedTracks` | Technotramp | Unexpected Tracks | 2023 | Techno-Tramping | `unexpectedTracks-0.1.4-build-35-release-signed.apk` |
-| `dreamer` | Michal Diviš | Dreamer | 2021 | Metal, Progressive rock, Djent | `dreamer-0.1.4-build-35-release-signed.apk` |
-| `krehkyMechanismus` | První Hoře | Křehký mechanismus pozemského štěstí | 2017 | Progressive rock, Metal, Alternative, Avantgarde | `krehkyMechanismus-0.1.4-build-35-release-signed.apk` |
-
 Current IPFS album roots:
 
 | Flavor | Artist | Album | Year | Genres | IPFS entry |
@@ -17,18 +9,6 @@ Current IPFS album roots:
 | `unexpectedTracks` | Technotramp | Unexpected Tracks | 2023 | Techno-Tramping | `https://ipfs.io/ipfs/bafybeiewkxwysf4jlnhbxs7pd4junvkrrais76qm3qgkpn3en4b2lcqxwm/index.htm` |
 | `dreamer` | Michal Diviš | Dreamer | 2021 | Metal, Progressive rock, Djent | `https://ipfs.io/ipfs/bafybeiaknjru5kws3exdyleahfleoh3ud3bp5ve7l3e7yeqmzo3sp7rcii/index.htm` |
 | `krehkyMechanismus` | První Hoře | Křehký mechanismus pozemského štěstí | 2017 | Progressive rock, Metal, Alternative, Avantgarde | `https://ipfs.io/ipfs/bafybeigmjwx26qgubv6ddciwuwbatpgcdrw6mnhgz4qy5bd55nb3trosfu/index.htm` |
-
-Current release APK IPFS mirrors:
-
-- `unexpectedTracks-0.1.4-build-35-release-signed.apk`: https://bafybeifvc7lpluy35rpmxr427te66xnnhonb4yf36gjdaigezauqprywcq.ipfs.dweb.link?filename=unexpectedTracks-0.1.4-build-35-release-signed.apk
-- `dreamer-0.1.4-build-35-release-signed.apk`: https://bafybeifg5isuchtxxfthyro2zfeabxjjjjfhhau3qqatedfxnr6ojj6uuq.ipfs.dweb.link?filename=dreamer-0.1.4-build-35-release-signed.apk
-- `krehkyMechanismus-0.1.4-build-35-release-signed.apk`: https://bafybeieax5iqfo6ivvpps6bd6pb3fvsdlcowu4si3ekmbyrttk6jpdevlm.ipfs.dweb.link?filename=krehkyMechanismus-0.1.4-build-35-release-signed.apk
-
-VirusTotal checks for the release APK files reported `0/66` security vendors flagging the files as malicious:
-
-- `unexpectedTracks-0.1.4-build-35-release-signed.apk`: https://www.virustotal.com/gui/file/33355b38eb97ede0cdd237a04c050052f3e34449ed81d9102dfa66f68b2077eb
-- `dreamer-0.1.4-build-35-release-signed.apk`: https://www.virustotal.com/gui/file/adb6a1ee6d2317b1d1229c49a5620ea760a7b08b3d2ac7c30b1ce7177e272e9c
-- `krehkyMechanismus-0.1.4-build-35-release-signed.apk`: https://www.virustotal.com/gui/file/6110a145a841a1ffcc397f7b7fc262ed0f721355a9972e1900ab448221b19260
 
 The viewer does not launch a general-purpose browser. Android WebView loads a local `127.0.0.1` address served by a small proxy. The proxy fetches data from `ipfs.io`, removes the gateway download behavior that prevents rendering, and fills MIME types by file extension.
 
@@ -68,9 +48,9 @@ The `0.1.5-build-37` release APK files are mirrored on IPFS and have public Viru
 
 | APK | IPFS mirror | VirusTotal |
 | --- | --- | --- |
-| `unexpectedTracks-0.1.5-build-37-release-signed.apk` | https://bafybeiaplogko4xh5ejx437rxxtyquykjomvjary2qkcji3qb7cgabnlwi.ipfs.dweb.link?filename=unexpectedTracks-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/cfd66dee7e0b0a80e50380fbc1363dae9525cfe88a564c50ceea3ee22224a792/details |
-| `dreamer-0.1.5-build-37-release-signed.apk` | https://bafybeigjnvd2jduytqgaizux57jhbkprjl4pqxfv2b67hn2pvbai23qxye.ipfs.dweb.link?filename=dreamer-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/b8c1b3a20d06014a76947c90e1527a226a275c936b4ac4737124eb3d3df24ad9/details |
-| `krehkyMechanismus-0.1.5-build-37-release-signed.apk` | https://bafybeidgkzctvp7dzza5i5ngd6yzabejr5pwatoqgiy2fi2rldqmopecg4.ipfs.dweb.link?filename=krehkyMechanismus-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/f0b177a40b6183927116527015fe57ab9aacfd44cb46d7933361384b711370a7/details |
+| [`unexpectedTracks-0.1.5-build-37-release-signed.apk`](https://github.com/entlaabstudio/rplayer-gateway-viewer/releases/download/v0.1.5/unexpectedTracks-0.1.5-build-37-release-signed.apk) | https://bafybeiaplogko4xh5ejx437rxxtyquykjomvjary2qkcji3qb7cgabnlwi.ipfs.dweb.link?filename=unexpectedTracks-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/cfd66dee7e0b0a80e50380fbc1363dae9525cfe88a564c50ceea3ee22224a792/details |
+| [`dreamer-0.1.5-build-37-release-signed.apk`](https://github.com/entlaabstudio/rplayer-gateway-viewer/releases/download/v0.1.5/dreamer-0.1.5-build-37-release-signed.apk) | https://bafybeigjnvd2jduytqgaizux57jhbkprjl4pqxfv2b67hn2pvbai23qxye.ipfs.dweb.link?filename=dreamer-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/b8c1b3a20d06014a76947c90e1527a226a275c936b4ac4737124eb3d3df24ad9/details |
+| [`krehkyMechanismus-0.1.5-build-37-release-signed.apk`](https://github.com/entlaabstudio/rplayer-gateway-viewer/releases/download/v0.1.5/krehkyMechanismus-0.1.5-build-37-release-signed.apk) | https://bafybeidgkzctvp7dzza5i5ngd6yzabejr5pwatoqgiy2fi2rldqmopecg4.ipfs.dweb.link?filename=krehkyMechanismus-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/f0b177a40b6183927116527015fe57ab9aacfd44cb46d7933361384b711370a7/details |
 
 ## Signing
 
