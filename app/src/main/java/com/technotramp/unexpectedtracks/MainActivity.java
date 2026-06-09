@@ -48,6 +48,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * Main Android entry point for the single-album viewer.
@@ -1311,7 +1313,11 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        closeQuietly(activeDownloadSession.outputStream);
+        if (activeDownloadSession.zipOutputStream != null) {
+            closeQuietly(activeDownloadSession.zipOutputStream);
+        } else {
+            closeQuietly(activeDownloadSession.outputStream);
+        }
         deleteTempFile(activeDownloadSession.file);
         activeDownloadSession = null;
     }
@@ -1360,6 +1366,45 @@ public final class MainActivity extends Activity {
         }
 
         return cleanName;
+    }
+
+    /**
+     * Sanitizes a RPlayer ZIP entry path before it is written by ZipOutputStream.
+     *
+     * @param path ZIP entry path requested by JavaScript
+     * @return safe relative ZIP entry path
+     */
+    private static String sanitizeZipEntryPath(String path) {
+        if (path == null) {
+            throw new IllegalArgumentException("ZIP entry path is empty.");
+        }
+
+        String normalizedPath = path.replace('\\', '/').trim();
+        while (normalizedPath.startsWith("/")) {
+            normalizedPath = normalizedPath.substring(1);
+        }
+
+        String[] parts = normalizedPath.split("/");
+        StringBuilder cleanPath = new StringBuilder();
+        for (String part : parts) {
+            String cleanPart = part.trim().replaceAll("[\\p{Cntrl}]", "_");
+            if (cleanPart.isEmpty() || ".".equals(cleanPart)) {
+                continue;
+            }
+            if ("..".equals(cleanPart)) {
+                throw new IllegalArgumentException("ZIP entry path contains parent traversal.");
+            }
+            if (cleanPath.length() > 0) {
+                cleanPath.append('/');
+            }
+            cleanPath.append(cleanPart);
+        }
+
+        if (cleanPath.length() == 0) {
+            throw new IllegalArgumentException("ZIP entry path is empty.");
+        }
+
+        return cleanPath.toString();
     }
 
     /**
@@ -1451,6 +1496,16 @@ public final class MainActivity extends Activity {
      */
     private final class DownloadBridge {
         /**
+         * Receives diagnostic messages from the JavaScript download bridge.
+         *
+         * @param message diagnostic message
+         */
+        @JavascriptInterface
+        public void log(String message) {
+            Log.i(LOG_TAG, "Download bridge: " + message);
+        }
+
+        /**
          * Starts a new temporary download file for a Blob generated inside WebView.
          *
          * @param downloadId JavaScript-generated identifier for this download
@@ -1477,6 +1532,163 @@ public final class MainActivity extends Activity {
                 Log.e(LOG_TAG, "Temporary download file could not be created.", exception);
                 showDownloadError("RPlayer Gateway Viewer could not create a temporary download file.");
             }
+        }
+
+        /**
+         * Starts a native ZIP file assembled from individual RPlayer entries.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         */
+        @JavascriptInterface
+        public synchronized void beginNativeZip(String downloadId) {
+            closeActiveDownloadSession();
+
+            try {
+                File file = File.createTempFile("rplayer-native-zip-", ".tmp", getCacheDir());
+                FileOutputStream outputStream = new FileOutputStream(file);
+                ZipOutputStream zipOutputStream = new ZipOutputStream(outputStream);
+
+                activeDownloadSession = new DownloadSession(
+                    downloadId,
+                    BuildConfig.DEFAULT_DOWNLOAD_FILE_NAME,
+                    "application/zip",
+                    0,
+                    file,
+                    outputStream,
+                    zipOutputStream
+                );
+
+                Log.i(LOG_TAG, "Native ZIP download started.");
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Native ZIP file could not be created.", exception);
+                showDownloadError("RPlayer Gateway Viewer could not create a native ZIP file.");
+            }
+        }
+
+        /**
+         * Adds a UTF-8 text file entry to the active native ZIP.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         * @param text UTF-8 text content
+         */
+        @JavascriptInterface
+        public synchronized void addNativeZipTextEntry(String downloadId, String path, String text) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            try {
+                beginNativeZipEntryInternal(path);
+                byte[] data = (text == null ? "" : text).getBytes(StandardCharsets.UTF_8);
+                activeDownloadSession.zipOutputStream.write(data);
+                activeDownloadSession.receivedBytes += data.length;
+                finishNativeZipEntryInternal();
+            } catch (IOException | IllegalArgumentException exception) {
+                Log.e(LOG_TAG, "Native ZIP text entry could not be written.", exception);
+                failDownload(downloadId, "Native ZIP text entry could not be written.");
+            }
+        }
+
+        /**
+         * Starts a binary file entry in the active native ZIP.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         */
+        @JavascriptInterface
+        public synchronized void beginNativeZipEntry(String downloadId, String path) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            try {
+                beginNativeZipEntryInternal(path);
+            } catch (IOException | IllegalArgumentException exception) {
+                Log.e(LOG_TAG, "Native ZIP entry could not be started.", exception);
+                failDownload(downloadId, "Native ZIP entry could not be started.");
+            }
+        }
+
+        /**
+         * Appends one Base64-encoded binary chunk to the current native ZIP entry.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param base64Chunk Base64-encoded binary payload
+         */
+        @JavascriptInterface
+        public synchronized void appendNativeZipEntryChunk(String downloadId, String base64Chunk) {
+            if (!isActiveNativeZip(downloadId) || activeDownloadSession.currentZipEntry == null) {
+                return;
+            }
+
+            try {
+                byte[] data = Base64.decode(base64Chunk, Base64.NO_WRAP);
+                activeDownloadSession.zipOutputStream.write(data);
+                activeDownloadSession.receivedBytes += data.length;
+            } catch (IOException | IllegalArgumentException exception) {
+                Log.e(LOG_TAG, "Native ZIP binary chunk could not be written.", exception);
+                failDownload(downloadId, "Native ZIP binary chunk could not be written.");
+            }
+        }
+
+        /**
+         * Finishes the current binary file entry in the active native ZIP.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         */
+        @JavascriptInterface
+        public synchronized void finishNativeZipEntry(String downloadId) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            try {
+                finishNativeZipEntryInternal();
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Native ZIP entry could not be finalized.", exception);
+                failDownload(downloadId, "Native ZIP entry could not be finalized.");
+            }
+        }
+
+        /**
+         * Finalizes the native ZIP file and opens Android's save dialog.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param fileName suggested filename from RPlayer
+         */
+        @JavascriptInterface
+        public synchronized void finishNativeZip(String downloadId, String fileName) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            DownloadSession session = activeDownloadSession;
+            activeDownloadSession = null;
+
+            try {
+                if (session.currentZipEntry != null) {
+                    session.zipOutputStream.closeEntry();
+                    session.currentZipEntry = null;
+                }
+                session.zipOutputStream.finish();
+                session.zipOutputStream.close();
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Native ZIP file could not be finalized.", exception);
+                deleteTempFile(session.file);
+                showDownloadError("RPlayer Gateway Viewer could not finalize the native ZIP file.");
+                return;
+            }
+
+            PendingDownload download = new PendingDownload(
+                sanitizeFileName(fileName),
+                session.mimeType,
+                session.file
+            );
+            Log.i(LOG_TAG, "Native ZIP download finished: " + download.fileName
+                + ", entries=" + session.zipEntryCount
+                + ", bytes=" + session.receivedBytes);
+            runOnUiThread(() -> openSaveDialog(download));
         }
 
         /**
@@ -1564,6 +1776,49 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Checks whether a JavaScript callback belongs to the current native ZIP session.
+         *
+         * @param downloadId JavaScript-generated identifier to validate
+         * @return true when the callback belongs to an active native ZIP session
+         */
+        private boolean isActiveNativeZip(String downloadId) {
+            return isActiveDownload(downloadId) && activeDownloadSession.zipOutputStream != null;
+        }
+
+        /**
+         * Opens a sanitized file entry in the active native ZIP.
+         *
+         * @param path ZIP entry path requested by RPlayer
+         * @throws IOException when the ZIP stream rejects the entry
+         */
+        private void beginNativeZipEntryInternal(String path) throws IOException {
+            if (activeDownloadSession.currentZipEntry != null) {
+                throw new IOException("Previous native ZIP entry is still open.");
+            }
+
+            String cleanPath = sanitizeZipEntryPath(path);
+            ZipEntry zipEntry = new ZipEntry(cleanPath);
+            activeDownloadSession.zipOutputStream.putNextEntry(zipEntry);
+            activeDownloadSession.currentZipEntry = cleanPath;
+            activeDownloadSession.zipEntryCount += 1;
+            Log.i(LOG_TAG, "Native ZIP entry started: " + cleanPath);
+        }
+
+        /**
+         * Closes the currently open file entry in the active native ZIP.
+         *
+         * @throws IOException when the ZIP stream cannot close the entry
+         */
+        private void finishNativeZipEntryInternal() throws IOException {
+            if (activeDownloadSession.currentZipEntry == null) {
+                return;
+            }
+
+            activeDownloadSession.zipOutputStream.closeEntry();
+            activeDownloadSession.currentZipEntry = null;
+        }
+
+        /**
          * Shows a download error from the UI thread.
          *
          * @param message message displayed over the WebView
@@ -1583,8 +1838,11 @@ public final class MainActivity extends Activity {
         private final long totalBytes;
         private final File file;
         private final FileOutputStream outputStream;
+        private final ZipOutputStream zipOutputStream;
         private int nextChunkIndex;
         private long receivedBytes;
+        private int zipEntryCount;
+        private String currentZipEntry;
 
         private DownloadSession(
             String downloadId,
@@ -1594,12 +1852,25 @@ public final class MainActivity extends Activity {
             File file,
             FileOutputStream outputStream
         ) {
+            this(downloadId, fileName, mimeType, totalBytes, file, outputStream, null);
+        }
+
+        private DownloadSession(
+            String downloadId,
+            String fileName,
+            String mimeType,
+            long totalBytes,
+            File file,
+            FileOutputStream outputStream,
+            ZipOutputStream zipOutputStream
+        ) {
             this.downloadId = downloadId;
             this.fileName = fileName;
             this.mimeType = mimeType;
             this.totalBytes = totalBytes;
             this.file = file;
             this.outputStream = outputStream;
+            this.zipOutputStream = zipOutputStream;
         }
     }
 
