@@ -247,6 +247,286 @@
         return originalSaveAs.apply(this, arguments);
     };
 
+    /**
+     * Converts an object or array-like collection to a plain array of values.
+     *
+     * @param {*} collection RPlayer collection to normalize.
+     * @returns {Array} Collection values.
+     */
+    function collectionValues(collection) {
+        if (!collection) {
+            return [];
+        }
+
+        return Object.keys(collection).map(function(key) {
+            return collection[key];
+        });
+    }
+
+    /**
+     * Checks whether a download checkbox is enabled.
+     *
+     * @param {string} checkboxId DOM id of the related checkbox.
+     * @param {boolean} fallback Value used when the checkbox is not present.
+     * @returns {boolean} Current checkbox state.
+     */
+    function isChecked(checkboxId, fallback) {
+        if (!checkboxId) {
+            return fallback !== false;
+        }
+
+        var checkbox = window.jQuery && window.jQuery('#' + checkboxId);
+        if (!checkbox || checkbox.length === 0) {
+            return fallback !== false;
+        }
+
+        return checkbox.is(':checked');
+    }
+
+    /**
+     * Checks whether one RPlayer bundle option is enabled.
+     *
+     * @param {string} optionId DOM id of the bundle option checkbox.
+     * @returns {boolean} true when the option is checked.
+     */
+    function isBundleOptionChecked(optionId) {
+        return isChecked('rplayerCheckboxDownloadBundleOptions_' + optionId, true);
+    }
+
+    /**
+     * Resolves a RPlayer source path against the current proxied document.
+     *
+     * @param {string} sourcePath Relative or absolute RPlayer asset path.
+     * @returns {string} Absolute local proxy URL.
+     */
+    function resolveSourceUrl(sourcePath) {
+        return new URL(sourcePath, document.baseURI).href;
+    }
+
+    /**
+     * Joins ZIP path segments into one relative archive path.
+     *
+     * @param {...string} parts Path segments.
+     * @returns {string} ZIP entry path.
+     */
+    function zipPath() {
+        return joinZipPath(Array.prototype.slice.call(arguments));
+    }
+
+    /**
+     * Disables the RPlayer download controls while native ZIP streaming is active.
+     *
+     * @param {object} downloads RPlayer downloads instance.
+     */
+    function disableDownloadUi(downloads) {
+        if (!window.jQuery) {
+            return;
+        }
+
+        window.jQuery('#rplayerDownloads .button.rplayerDownloadSubmit').addClass('loading disabled');
+        window.jQuery('#rplayerDownloads input').attr('disabled', 'disabled');
+        window.jQuery(downloads.rplayerCfg.app.htmlSelectors.mainWindow + ' .downloadsButton').css({
+            opacity: '0.3'
+        });
+    }
+
+    /**
+     * Restores the RPlayer download controls after native ZIP streaming ends.
+     *
+     * @param {object} downloads RPlayer downloads instance.
+     */
+    function restoreDownloadUi(downloads) {
+        if (!window.jQuery) {
+            return;
+        }
+
+        window.jQuery('#rplayerDownloads .button.rplayerDownloadSubmit').removeClass('loading disabled');
+        window.jQuery('#rplayerDownloads input').removeAttr('disabled');
+        window.jQuery(downloads.rplayerCfg.app.htmlSelectors.mainWindow + ' .downloadsButton').css({
+            opacity: '1'
+        });
+    }
+
+    /**
+     * Synchronizes RPlayer's download flags with the current checkbox state.
+     *
+     * @param {object} downloads RPlayer downloads instance.
+     */
+    function syncDownloadSelection(downloads) {
+        collectionValues(downloads.download.mp3).forEach(function(entry) {
+            entry.download = isChecked(entry.checkboxId, entry.download);
+        });
+
+        collectionValues(downloads.download.others).forEach(function(group) {
+            collectionValues(group.files).forEach(function(entry) {
+                entry.download = isChecked(entry.checkboxId, entry.download);
+            });
+        });
+
+        collectionValues(downloads.download.unsorted).forEach(function(entry) {
+            entry.download = isChecked(entry.checkboxId, entry.download);
+        });
+
+        downloads.download.coverImage.download = isBundleOptionChecked('CoverImage');
+        collectionValues(downloads.download.slideshowImages).forEach(function(entry) {
+            entry.download = isBundleOptionChecked('SlideshowImages');
+        });
+    }
+
+    /**
+     * Streams one source file into the active native ZIP through Android.
+     *
+     * @param {string} downloadId Native ZIP session identifier.
+     * @param {string} path ZIP entry path.
+     * @param {string} sourcePath RPlayer source path.
+     */
+    function addSourceEntry(downloadId, path, sourcePath) {
+        if (!sourcePath) {
+            return;
+        }
+
+        var sourceUrl = resolveSourceUrl(sourcePath);
+        window.RPlayerGatewayDownloads.log('Native ZIP source entry: ' + path + ' <- ' + sourceUrl);
+        window.RPlayerGatewayDownloads.addNativeZipSourceEntry(downloadId, path, sourceUrl);
+    }
+
+    /**
+     * Adds one UTF-8 text entry to the active native ZIP.
+     *
+     * @param {string} downloadId Native ZIP session identifier.
+     * @param {string} path ZIP entry path.
+     * @param {string} text Text content.
+     */
+    function addTextEntry(downloadId, path, text) {
+        window.RPlayerGatewayDownloads.log('Native ZIP text entry: ' + path + ' (' + String(text || '').length + ' chars)');
+        window.RPlayerGatewayDownloads.addNativeZipTextEntry(downloadId, path, text || '');
+    }
+
+    /**
+     * Builds one complete RPlayer ZIP archive by streaming source files natively.
+     *
+     * @param {object} downloads RPlayer downloads instance.
+     */
+    function runNativeStreamingDownload(downloads) {
+        var downloadId = createDownloadId();
+        var baseFolderName = downloads.rplayerCfg.album.info.composer
+            + ' - '
+            + downloads.rplayerCfg.album.info.year
+            + ' - '
+            + downloads.rplayerCfg.album.info.name;
+
+        disableDownloadUi(downloads);
+        syncDownloadSelection(downloads);
+        window.RPlayerGatewayDownloads.beginNativeZip(downloadId);
+        window.RPlayerGatewayDownloads.log('Native streaming download started for: ' + baseFolderName);
+
+        try {
+            collectionValues(downloads.download.mp3).forEach(function(entry) {
+                if (!entry.download || !entry.srcFile) {
+                    return;
+                }
+
+                addSourceEntry(downloadId, zipPath(baseFolderName, entry.fileName), entry.srcFile);
+
+                if (isBundleOptionChecked('TracksImages') && entry.srcImgFile) {
+                    addSourceEntry(
+                        downloadId,
+                        zipPath(baseFolderName, 'images', entry.mediaName + '.' + downloads.getFileExtension(entry.srcImgFile)),
+                        entry.srcImgFile
+                    );
+                }
+            });
+
+            if (isBundleOptionChecked('LyricsFile')) {
+                collectionValues(downloads.lyrics).forEach(function(entry) {
+                    addTextEntry(downloadId, zipPath(baseFolderName, 'info', 'lyrics', entry.fileName), entry.html);
+                });
+            }
+
+            if (isBundleOptionChecked('InfoFile')) {
+                collectionValues(downloads.story).forEach(function(entry) {
+                    addTextEntry(downloadId, zipPath(baseFolderName, 'info', 'tracks', entry.fileName), entry.html);
+                });
+            }
+
+            if (isBundleOptionChecked('AlbumInfoFile')) {
+                addTextEntry(downloadId, zipPath(baseFolderName, 'info', 'index.htm'), downloads.getAlbumInfoHtml());
+            }
+
+            collectionValues(downloads.download.others).forEach(function(group) {
+                collectionValues(group.files).forEach(function(entry) {
+                    if (!entry.download) {
+                        return;
+                    }
+
+                    addSourceEntry(
+                        downloadId,
+                        zipPath(baseFolderName, 'attachments', group.mediaName, entry.folder, entry.fileName),
+                        entry.srcFile
+                    );
+                });
+            });
+
+            collectionValues(downloads.download.unsorted).forEach(function(entry) {
+                if (!entry.download) {
+                    return;
+                }
+
+                addSourceEntry(downloadId, zipPath(baseFolderName, 'attachments', entry.folder, entry.fileName), entry.srcFile);
+            });
+
+            if (downloads.download.coverImage.download) {
+                addSourceEntry(downloadId, zipPath(baseFolderName, downloads.download.coverImage.fileName), downloads.download.coverImage.srcFile);
+            }
+
+            collectionValues(downloads.download.slideshowImages).forEach(function(entry) {
+                if (!entry.download) {
+                    return;
+                }
+
+                addSourceEntry(downloadId, zipPath(baseFolderName, 'images', 'slideshow', entry.fileName), entry.srcFile);
+            });
+
+            collectionValues(downloads.justZipIt).forEach(function(entry) {
+                if (entry.srcFile) {
+                    addSourceEntry(downloadId, zipPath(baseFolderName, entry.folder, entry.fileName), entry.srcFile);
+                } else if (entry.data && typeof entry.data === 'string') {
+                    addTextEntry(downloadId, zipPath(baseFolderName, entry.folder, entry.fileName), entry.data);
+                }
+            });
+
+            window.RPlayerGatewayDownloads.finishNativeZip(downloadId, baseFolderName + '.zip');
+            window.RPlayerGatewayDownloads.log('Native streaming download finished for: ' + baseFolderName);
+        } catch (error) {
+            window.RPlayerGatewayDownloads.failDownload(downloadId, 'Native streaming download failed: ' + (error && error.message ? error.message : error));
+        } finally {
+            restoreDownloadUi(downloads);
+        }
+    }
+
+    /**
+     * Replaces RPlayer's RAM-heavy downloadAction with a native streaming ZIP plan.
+     */
+    function installNativeDownloadActionHook() {
+        var downloads = window.RPlayerGatewayViewerDownloads;
+        if (!downloads) {
+            window.setTimeout(installNativeDownloadActionHook, 500);
+            return;
+        }
+
+        if (downloads.rplayerGatewayNativeDownloadActionHook) {
+            return;
+        }
+
+        downloads.rplayerGatewayOriginalDownloadAction = downloads.downloadAction;
+        downloads.downloadAction = function() {
+            runNativeStreamingDownload(downloads);
+        };
+        downloads.rplayerGatewayNativeDownloadActionHook = true;
+        window.RPlayerGatewayDownloads.log('Native streaming downloadAction hook installed.');
+    }
+
     window.RPlayerGatewayViewerSaveAsHook = true;
     installNativeZipHook();
+    installNativeDownloadActionHook();
 }());

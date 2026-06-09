@@ -45,6 +45,7 @@ final class GatewayProxyServer implements Closeable {
     private static final String ENTRY_FILE = "index.htm";
     private static final String IPFS_ROOT_PATH = "/ipfs/" + IPFS_CID + "/";
     private static final String ROOT_PATH = IPFS_ROOT_PATH + ENTRY_FILE;
+    private static final String RPLAYER_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.js";
     private static final int BUFFER_SIZE = 32 * 1024;
     private static final long SLOW_REQUEST_LOG_THRESHOLD_MS = 5000;
     private static final long CACHE_REPAIR_RETRY_DELAY_MS = 5000;
@@ -282,11 +283,10 @@ final class GatewayProxyServer implements Closeable {
         String contentType = MimeTypes.fromPath(request.path, connection.getContentType());
         byte[] injectedResponseBody = null;
 
-        if (!"HEAD".equals(request.method) && shouldInjectHtmlBridge(request, statusCode, contentType)) {
-            byte[] originalHtmlBody = readStreamBytes(responseStream);
-            storeCompleteResponse(request, originalHtmlBody, statusCode, contentType, cacheHeadersFrom(connection));
-            String html = new String(originalHtmlBody, StandardCharsets.UTF_8);
-            injectedResponseBody = injectHtmlBridge(html).getBytes(StandardCharsets.UTF_8);
+        if (!"HEAD".equals(request.method) && shouldTransformTextResponse(request, statusCode, contentType)) {
+            byte[] originalBody = readStreamBytes(responseStream);
+            storeCompleteResponse(request, originalBody, statusCode, contentType, cacheHeadersFrom(connection));
+            injectedResponseBody = transformTextResponse(request, originalBody, contentType);
             responseStream = new ByteArrayInputStream(injectedResponseBody);
         }
 
@@ -340,6 +340,66 @@ final class GatewayProxyServer implements Closeable {
         outputStream.flush();
         closeQuietly(responseStream);
         return 0;
+    }
+
+    /**
+     * Checks whether a proxied text response needs a local viewer patch before WebView sees it.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @param contentType resolved response MIME type
+     * @return true when the response should be transformed
+     */
+    private boolean shouldTransformTextResponse(HttpRequest request, int statusCode, String contentType) {
+        return shouldInjectHtmlBridge(request, statusCode, contentType) || shouldPatchRPlayerScript(request, statusCode);
+    }
+
+    /**
+     * Applies the selected local text response patch.
+     *
+     * @param request parsed WebView request
+     * @param body original UTF-8 response body
+     * @param contentType resolved response MIME type
+     * @return transformed UTF-8 response body
+     */
+    private byte[] transformTextResponse(HttpRequest request, byte[] body, String contentType) {
+        String text = new String(body, StandardCharsets.UTF_8);
+
+        if (shouldPatchRPlayerScript(request, 200)) {
+            return patchRPlayerScript(text).getBytes(StandardCharsets.UTF_8);
+        }
+
+        return injectHtmlBridge(text).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Checks whether the main RPlayer module should expose its downloads instance to the wrapper.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @return true when rplayer.js should be patched
+     */
+    private static boolean shouldPatchRPlayerScript(HttpRequest request, int statusCode) {
+        return statusCode == 200 && RPLAYER_SCRIPT_PATH.equals(request.path);
+    }
+
+    /**
+     * Exposes the RPlayer downloads module instance without modifying the immutable IPFS content.
+     *
+     * @param script original rplayer.js source
+     * @return patched script source served only through the local proxy
+     */
+    private static String patchRPlayerScript(String script) {
+        String original = "new RPlayerDownloads(RPObj,QrCode);";
+        String patched = "window.RPlayerGatewayViewerDownloads = new RPlayerDownloads(RPObj,QrCode);";
+
+        if (!script.contains(original)) {
+            Log.w(LOG_TAG, "RPlayer downloads instance patch target was not found.");
+            return script;
+        }
+
+        Log.i(LOG_TAG, "RPlayer downloads instance exposed to viewer bridge.");
+        return script.replace(original, patched);
     }
 
     /**
@@ -407,8 +467,8 @@ final class GatewayProxyServer implements Closeable {
         byte[] body = null;
         long contentLength = dataFile.length();
 
-        if (shouldInjectHtmlBridge(request, 200, metadata.contentType)) {
-            body = injectHtmlBridge(new String(readStreamBytes(inputStream), StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
+        if (shouldTransformTextResponse(request, 200, metadata.contentType)) {
+            body = transformTextResponse(request, readStreamBytes(inputStream), metadata.contentType);
             closeQuietly(inputStream);
             inputStream = new ByteArrayInputStream(body);
             contentLength = body.length;

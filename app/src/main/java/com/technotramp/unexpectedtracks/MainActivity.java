@@ -912,8 +912,19 @@ public final class MainActivity extends Activity {
      */
     private boolean isLocalArtworkUrl(String artworkUrl) {
         return artworkUrl != null
+            && isLocalProxyAlbumUrl(artworkUrl);
+    }
+
+    /**
+     * Checks whether a source URL belongs to the current local proxy album root.
+     *
+     * @param sourceUrl source URL requested by a native helper
+     * @return true when the URL points to the local proxy album root
+     */
+    private boolean isLocalProxyAlbumUrl(String sourceUrl) {
+        return sourceUrl != null
             && !localProxyAlbumRootUrl.isEmpty()
-            && artworkUrl.startsWith(localProxyAlbumRootUrl);
+            && sourceUrl.startsWith(localProxyAlbumRootUrl);
     }
 
     /**
@@ -1587,6 +1598,59 @@ public final class MainActivity extends Activity {
             } catch (IOException | IllegalArgumentException exception) {
                 Log.e(LOG_TAG, "Native ZIP text entry could not be written.", exception);
                 failDownload(downloadId, "Native ZIP text entry could not be written.");
+            }
+        }
+
+        /**
+         * Streams a local proxy resource directly into one native ZIP entry.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         * @param sourceUrl local proxy source URL to stream from
+         */
+        @JavascriptInterface
+        public synchronized void addNativeZipSourceEntry(String downloadId, String path, String sourceUrl) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            if (!isLocalProxyAlbumUrl(sourceUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP source outside album proxy: " + sourceUrl);
+                failDownload(downloadId, "Native ZIP source is outside the album proxy.");
+                return;
+            }
+
+            HttpURLConnection connection = null;
+
+            try {
+                beginNativeZipEntryInternal(path);
+                connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(30000);
+
+                int statusCode = connection.getResponseCode();
+                if (statusCode < 200 || statusCode >= 300) {
+                    throw new IOException("Native ZIP source returned HTTP " + statusCode + ": " + sourceUrl);
+                }
+
+                try (InputStream inputStream = connection.getInputStream()) {
+                    byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                    int read;
+                    while ((read = inputStream.read(buffer)) >= 0) {
+                        activeDownloadSession.zipOutputStream.write(buffer, 0, read);
+                        activeDownloadSession.receivedBytes += read;
+                    }
+                }
+
+                finishNativeZipEntryInternal();
+                Log.i(LOG_TAG, "Native ZIP source entry finished: " + path + " <- " + sourceUrl);
+            } catch (IOException | IllegalArgumentException exception) {
+                Log.e(LOG_TAG, "Native ZIP source entry could not be written.", exception);
+                failDownload(downloadId, "Native ZIP source entry could not be written.");
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
             }
         }
 
