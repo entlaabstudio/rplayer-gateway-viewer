@@ -389,8 +389,23 @@
         restoreDownloadUi(activeNativeDownloads);
         activeNativeDownloads = null;
 
-        if (window.jQuery) {
-            window.jQuery('#rplayerDownloadsProgress').removeClass('active');
+        if (!window.jQuery) {
+            return;
+        }
+
+        var progress = window.jQuery('#rplayerDownloadsProgress');
+        progress.removeClass('active success warning error').css({
+            opacity: '0'
+        }).removeAttr('title');
+
+        if (typeof progress.progress === 'function') {
+            progress.progress({
+                percent: 0
+            });
+        } else {
+            progress.find('.bar').css({
+                width: '0%'
+            });
         }
     }
 
