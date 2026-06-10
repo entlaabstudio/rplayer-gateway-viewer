@@ -49,6 +49,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -1584,6 +1585,8 @@ public final class MainActivity extends Activity {
                 File file = File.createTempFile("rplayer-native-zip-", ".tmp", getCacheDir());
                 FileOutputStream outputStream = new FileOutputStream(file);
                 ZipOutputStream zipOutputStream = new ZipOutputStream(outputStream);
+                // RPlayer download packages already contain compressed media assets.
+                zipOutputStream.setLevel(Deflater.NO_COMPRESSION);
 
                 activeDownloadSession = new DownloadSession(
                     downloadId,
