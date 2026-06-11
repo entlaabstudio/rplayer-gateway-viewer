@@ -33,6 +33,9 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -1691,6 +1694,86 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Streams an MP3 file into one native ZIP entry with RPlayer ID3 metadata.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         * @param sourceUrl local proxy MP3 source URL to stream from
+         * @param metadataJson JSON-encoded track metadata and optional image URLs
+         */
+        @JavascriptInterface
+        public void addNativeZipTaggedMp3Entry(String downloadId, String path, String sourceUrl, String metadataJson) {
+            if (!isLocalProxyAlbumUrl(sourceUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP MP3 source outside album proxy: " + sourceUrl);
+                failDownload(downloadId, "Native ZIP MP3 source is outside the album proxy.");
+                return;
+            }
+
+            JSONObject metadata;
+            try {
+                metadata = new JSONObject(metadataJson == null ? "{}" : metadataJson);
+            } catch (JSONException exception) {
+                Log.e(LOG_TAG, "Native ZIP MP3 metadata could not be parsed.", exception);
+                failDownload(downloadId, "Native ZIP MP3 metadata could not be parsed.");
+                return;
+            }
+
+            String coverImageUrl = metadata.optString("coverImageUrl", "");
+            String iconImageUrl = metadata.optString("iconImageUrl", "");
+            if (!isBlank(coverImageUrl) && !isLocalProxyAlbumUrl(coverImageUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP MP3 cover outside album proxy: " + coverImageUrl);
+                failDownload(downloadId, "Native ZIP MP3 cover is outside the album proxy.");
+                return;
+            }
+
+            if (!isBlank(iconImageUrl) && !isLocalProxyAlbumUrl(iconImageUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP MP3 icon outside album proxy: " + iconImageUrl);
+                failDownload(downloadId, "Native ZIP MP3 icon is outside the album proxy.");
+                return;
+            }
+
+            submitNativeZipTask(downloadId, "Native ZIP tagged MP3 entry could not be written.", session -> {
+                HttpURLConnection connection = null;
+
+                try {
+                    byte[] coverImage = readOptionalNativeZipBytes(coverImageUrl);
+                    byte[] iconImage = readOptionalNativeZipBytes(iconImageUrl);
+                    byte[] id3Tag = Id3TagWriter.buildTag(metadata, coverImage, iconImage);
+
+                    beginNativeZipEntryInternal(session, path);
+                    session.zipOutputStream.write(id3Tag);
+                    session.receivedBytes += id3Tag.length;
+
+                    connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+                    connection.setConnectTimeout(15000);
+                    connection.setReadTimeout(30000);
+
+                    int statusCode = connection.getResponseCode();
+                    if (statusCode < 200 || statusCode >= 300) {
+                        throw new IOException("Native ZIP MP3 source returned HTTP " + statusCode + ": " + sourceUrl);
+                    }
+
+                    try (InputStream inputStream = connection.getInputStream()) {
+                        byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                        session.receivedBytes += Id3TagWriter.copyMp3WithoutExistingTag(
+                            inputStream,
+                            session.zipOutputStream,
+                            buffer
+                        );
+                    }
+
+                    finishNativeZipEntryInternal(session);
+                    markNativeZipEntryFinished(session, path);
+                    Log.i(LOG_TAG, "Native ZIP tagged MP3 entry finished: " + path + " <- " + sourceUrl);
+                } finally {
+                    if (connection != null) {
+                        connection.disconnect();
+                    }
+                }
+            });
+        }
+
+        /**
          * Starts a binary file entry in the active native ZIP.
          *
          * @param downloadId JavaScript-generated identifier for this ZIP build
@@ -2020,6 +2103,56 @@ public final class MainActivity extends Activity {
                 session.expectedZipEntries,
                 currentEntry == null ? "" : currentEntry
             );
+        }
+
+        /**
+         * Reads an optional local proxy resource fully for metadata embedding.
+         *
+         * @param sourceUrl local proxy URL or blank value
+         * @return resource bytes, or null when no resource was requested
+         * @throws IOException when the resource cannot be read
+         */
+        private byte[] readOptionalNativeZipBytes(String sourceUrl) throws IOException {
+            if (isBlank(sourceUrl)) {
+                return null;
+            }
+
+            HttpURLConnection connection = null;
+            try {
+                connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(30000);
+
+                int statusCode = connection.getResponseCode();
+                if (statusCode < 200 || statusCode >= 300) {
+                    throw new IOException("Native ZIP metadata resource returned HTTP " + statusCode + ": " + sourceUrl);
+                }
+
+                try (InputStream inputStream = connection.getInputStream()) {
+                    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                    byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                    int read;
+                    while ((read = inputStream.read(buffer)) >= 0) {
+                        outputStream.write(buffer, 0, read);
+                    }
+
+                    return outputStream.toByteArray();
+                }
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }
+
+        /**
+         * Checks whether a string is null, empty, or only whitespace.
+         *
+         * @param value checked string
+         * @return true when no meaningful value is present
+         */
+        private boolean isBlank(String value) {
+            return value == null || value.trim().isEmpty();
         }
 
         /**

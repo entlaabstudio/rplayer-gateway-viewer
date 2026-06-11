@@ -455,6 +455,99 @@
     }
 
     /**
+     * Converts an RPlayer metadata value into a flat string array.
+     *
+     * @param {*} value RPlayer metadata value.
+     * @returns {string[]} Normalized string list.
+     */
+    function normalizeStringArray(value) {
+        if (Array.isArray(value)) {
+            return value.reduce(function(result, item) {
+                if (Array.isArray(item)) {
+                    item.forEach(function(nestedItem) {
+                        if (nestedItem !== undefined && nestedItem !== null && String(nestedItem) !== '') {
+                            result.push(String(nestedItem));
+                        }
+                    });
+                    return result;
+                }
+
+                if (item !== undefined && item !== null && String(item) !== '') {
+                    result.push(String(item));
+                }
+
+                return result;
+            }, []);
+        }
+
+        if (value === undefined || value === null || String(value) === '') {
+            return [];
+        }
+
+        return [String(value)];
+    }
+
+    /**
+     * Builds native ID3 metadata for one RPlayer MP3 download entry.
+     *
+     * @param {object} downloads RPlayer downloads instance.
+     * @param {object} entry RPlayer MP3 download entry.
+     * @returns {object} JSON-serializable metadata for Android.
+     */
+    function buildMp3Metadata(downloads, entry) {
+        var albumInfo = downloads.rplayerCfg.album.info;
+        var metadata = {
+            trackNumber: entry.trackNumber || '',
+            comment: entry.comment || {
+                description: '',
+                text: ''
+            },
+            title: entry.mediaName || '',
+            artists: normalizeStringArray(entry.composer),
+            album: albumInfo.name || '',
+            albumArtist: albumInfo.composer || '',
+            genres: normalizeStringArray(entry.genres),
+            label: entry.label || '',
+            copyright: entry.copyright || '',
+            language: entry.lang || '',
+            bpm: entry.bpm || '',
+            isrc: entry.isrc || '',
+            year: albumInfo.year || ''
+        };
+
+        if (isBundleOptionChecked('ImagesToMp3') && entry.srcImgFile) {
+            metadata.coverImageUrl = resolveSourceUrl(entry.srcImgFile);
+        }
+
+        if (isBundleOptionChecked('IconsToMp3') && entry.srcIconFile) {
+            metadata.iconImageUrl = resolveSourceUrl(entry.srcIconFile);
+        }
+
+        return metadata;
+    }
+
+    /**
+     * Adds one MP3 source entry with native ID3 metadata to a ZIP plan.
+     *
+     * @param {object[]} plan Native ZIP entry plan.
+     * @param {string} path ZIP entry path.
+     * @param {object} entry RPlayer MP3 download entry.
+     * @param {object} downloads RPlayer downloads instance.
+     */
+    function addTaggedMp3Entry(plan, path, entry, downloads) {
+        if (!entry.srcFile) {
+            return;
+        }
+
+        plan.push({
+            type: 'taggedMp3',
+            path: path,
+            sourceUrl: resolveSourceUrl(entry.srcFile),
+            metadata: buildMp3Metadata(downloads, entry)
+        });
+    }
+
+    /**
      * Adds one UTF-8 text entry to a native ZIP plan.
      *
      * @param {object[]} plan Native ZIP entry plan.
@@ -484,7 +577,7 @@
                 return;
             }
 
-            addSourceEntry(plan, zipPath(baseFolderName, entry.fileName), entry.srcFile);
+            addTaggedMp3Entry(plan, zipPath(baseFolderName, entry.fileName), entry, downloads);
 
             if (isBundleOptionChecked('TracksImages') && entry.srcImgFile) {
                 addSourceEntry(
@@ -566,6 +659,17 @@
         if (entry.type === 'source') {
             window.RPlayerGatewayDownloads.log('Native ZIP source entry queued: ' + entry.path + ' <- ' + entry.sourceUrl);
             window.RPlayerGatewayDownloads.addNativeZipSourceEntry(downloadId, entry.path, entry.sourceUrl);
+            return;
+        }
+
+        if (entry.type === 'taggedMp3') {
+            window.RPlayerGatewayDownloads.log('Native ZIP tagged MP3 entry queued: ' + entry.path + ' <- ' + entry.sourceUrl);
+            window.RPlayerGatewayDownloads.addNativeZipTaggedMp3Entry(
+                downloadId,
+                entry.path,
+                entry.sourceUrl,
+                JSON.stringify(entry.metadata || {})
+            );
             return;
         }
 
