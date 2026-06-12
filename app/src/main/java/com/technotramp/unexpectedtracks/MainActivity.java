@@ -332,7 +332,7 @@ public final class MainActivity extends Activity {
                     return false;
                 }
 
-                if (isInternalWebViewUri(uri) && !request.isForMainFrame()) {
+                if ((isInternalWebViewUri(uri) || isLocalProxyInternalUri(uri)) && !request.isForMainFrame()) {
                     return false;
                 }
 
@@ -348,7 +348,9 @@ public final class MainActivity extends Activity {
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
 
-                if (isLocalProxyAlbumUri(uri) || (isInternalWebViewUri(uri) && !request.isForMainFrame())) {
+                if (isLocalProxyAlbumUri(uri)
+                    || ((isInternalWebViewUri(uri) || isLocalProxyInternalUri(uri)) && !request.isForMainFrame())
+                ) {
                     return super.shouldInterceptRequest(view, request);
                 }
 
@@ -430,6 +432,22 @@ public final class MainActivity extends Activity {
         String uriText = uri.toString();
         return uriText.equals(localProxyAlbumRootUrl.substring(0, localProxyAlbumRootUrl.length() - 1))
             || uriText.startsWith(localProxyAlbumRootUrl);
+    }
+
+
+    /**
+     * Checks whether a URI points to a private local proxy helper endpoint.
+     *
+     * @param uri URI requested by WebView.
+     * @return true when the URI belongs to the current local proxy helper namespace.
+     */
+    private boolean isLocalProxyInternalUri(Uri uri) {
+        if (uri == null || localProxyAlbumRootUrl.isEmpty()) {
+            return false;
+        }
+
+        String localProxyOrigin = localProxyAlbumRootUrl.substring(0, localProxyAlbumRootUrl.indexOf("/ipfs/"));
+        return uri.toString().startsWith(localProxyOrigin + "/__rplayer_gateway/");
     }
 
     /**

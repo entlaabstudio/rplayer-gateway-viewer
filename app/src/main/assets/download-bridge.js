@@ -17,6 +17,7 @@
     var nativeStreamingDownloadActive = false;
     var activeNativeDownloads = null;
 
+
     /**
      * Creates a short unique identifier for one Android-side download session.
      *

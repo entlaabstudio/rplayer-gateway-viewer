@@ -15,11 +15,13 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -156,6 +158,11 @@ final class GatewayProxyServer implements Closeable {
 
             if (!"GET".equals(request.method) && !"HEAD".equals(request.method)) {
                 writePlainResponse(socket, 405, "Method Not Allowed", "The method is not supported.");
+                return;
+            }
+
+            if (isCacheStateRequest(request)) {
+                writeCacheStateResponse(socket, request);
                 return;
             }
 
@@ -403,6 +410,83 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * Checks whether a local request asks for wrapper cache state JSON.
+     *
+     * @param request parsed WebView request
+     * @return true for the internal cache state endpoint
+     */
+    private static boolean isCacheStateRequest(HttpRequest request) {
+        return request.path.startsWith("/__rplayer_gateway/cache-state?");
+    }
+
+    /**
+     * Writes current persistent cache state for one safe album path.
+     *
+     * @param socket target socket connected to WebView
+     * @param request parsed WebView request
+     * @throws IOException when the response cannot be written
+     */
+    private void writeCacheStateResponse(Socket socket, HttpRequest request) throws IOException {
+        String checkedPath = queryParameter(request.path, "path");
+        boolean complete = isCompleteCachedPath(checkedPath);
+        byte[] body = ("{\"complete\":" + complete + "}").getBytes(StandardCharsets.UTF_8);
+
+        BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
+        outputStream.write("HTTP/1.1 200 OK\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        writeHeader(outputStream, "Content-Type", "application/json; charset=utf-8");
+        writeHeader(outputStream, "Cache-Control", "no-store");
+        writeHeader(outputStream, "Connection", "close");
+        writeHeader(outputStream, "Content-Length", String.valueOf(body.length));
+        outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        outputStream.write(body);
+        outputStream.flush();
+    }
+
+    /**
+     * Checks whether a safe album path has a complete valid persistent cache entry.
+     *
+     * @param path local IPFS path to check
+     * @return true when the cached file exists and passes local validation
+     */
+    private boolean isCompleteCachedPath(String path) {
+        if (!isSafeAlbumPath(path)) {
+            return false;
+        }
+
+        CacheEntry cacheEntry = cacheEntryFor(path);
+        CacheMetadata metadata = CacheMetadata.load(cacheEntry.metaFile);
+        return cacheEntry.dataFile.isFile() && metadata != null && isCacheEntryValid(cacheEntry, metadata);
+    }
+
+    /**
+     * Reads one URL query parameter from a local endpoint path.
+     *
+     * @param requestPath endpoint path with query string
+     * @param name query parameter name
+     * @return decoded parameter value, or an empty string when missing
+     */
+    private static String queryParameter(String requestPath, String name) {
+        int queryStart = requestPath.indexOf('?');
+        if (queryStart < 0 || queryStart >= requestPath.length() - 1) {
+            return "";
+        }
+
+        String prefix = name + "=";
+        String[] pairs = requestPath.substring(queryStart + 1).split("&");
+        for (String pair : pairs) {
+            if (pair.startsWith(prefix)) {
+                try {
+                    return URLDecoder.decode(pair.substring(prefix.length()), StandardCharsets.UTF_8.name());
+                } catch (IllegalArgumentException | java.io.UnsupportedEncodingException exception) {
+                    return "";
+                }
+            }
+        }
+
+        return "";
+    }
+
+    /**
      * Checks whether a local request path is inside the fixed album root and safe to proxy.
      *
      * Path is expected to be the normalized local request path.
@@ -429,7 +513,7 @@ final class GatewayProxyServer implements Closeable {
      * @throws IOException when the cached response cannot be written
      */
     private boolean serveFromCacheIfPossible(Socket socket, HttpRequest request) throws IOException {
-        if (!isCompleteCacheRequest(request)) {
+        if (!isCacheLookupRequest(request)) {
             return false;
         }
 
@@ -438,6 +522,9 @@ final class GatewayProxyServer implements Closeable {
 
         if (!cacheEntry.dataFile.isFile() || metadata == null) {
             Log.i(LOG_TAG, "Persistent cache miss: " + request.path);
+            if (isAlbumAudioRangeRequest(request)) {
+                scheduleCacheRepair(request.path, "audio range cache miss");
+            }
             return false;
         }
 
@@ -446,6 +533,18 @@ final class GatewayProxyServer implements Closeable {
             deleteCacheEntry(cacheEntry);
             scheduleCacheRepair(request.path, "invalid cache hit");
             return false;
+        }
+
+        if (isRangeRequest(request)) {
+            RangeRequest rangeRequest = parseRangeRequest(request.headers.get("range"), cacheEntry.dataFile.length());
+            if (rangeRequest == null) {
+                writeRangeNotSatisfiableResponse(socket, cacheEntry.dataFile.length());
+                return true;
+            }
+
+            Log.i(LOG_TAG, "Persistent cache range hit: " + request.path + rangeLogSuffix(request));
+            writeCachedRangeResponse(socket, cacheEntry.dataFile, metadata, rangeRequest);
+            return true;
         }
 
         Log.i(LOG_TAG, "Persistent cache hit: " + request.path);
@@ -503,6 +602,68 @@ final class GatewayProxyServer implements Closeable {
         copyStream(inputStream, outputStream);
         outputStream.flush();
         closeQuietly(inputStream);
+    }
+
+    /**
+     * Writes one byte range from a complete cached response.
+     *
+     * @param socket target socket connected to WebView
+     * @param dataFile cached original response body
+     * @param metadata cached response metadata
+     * @param rangeRequest requested byte range resolved against the cached file length
+     * @throws IOException when the cached response cannot be read or written
+     */
+    private void writeCachedRangeResponse(Socket socket, File dataFile, CacheMetadata metadata, RangeRequest rangeRequest) throws IOException {
+        BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
+        outputStream.write("HTTP/1.1 206 Partial Content\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        writeHeader(outputStream, "Content-Type", metadata.contentType);
+        writeHeader(outputStream, "Access-Control-Allow-Origin", "*");
+        writeHeader(outputStream, "Accept-Ranges", "bytes");
+        writeHeader(outputStream, "Cache-Control", CACHE_CONTROL_VALUE);
+        writeHeader(outputStream, "Connection", "close");
+        writeHeader(outputStream, "Content-Length", String.valueOf(rangeRequest.length()));
+        writeHeader(
+            outputStream,
+            "Content-Range",
+            "bytes " + rangeRequest.start + "-" + rangeRequest.end + "/" + rangeRequest.totalLength
+        );
+
+        if (!metadata.lastModified.isEmpty()) {
+            writeHeader(outputStream, "Last-Modified", metadata.lastModified);
+        }
+
+        if (!metadata.etag.isEmpty()) {
+            writeHeader(outputStream, "ETag", metadata.etag);
+        }
+
+        if (!metadata.ipfsPath.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Path", metadata.ipfsPath);
+        }
+
+        if (!metadata.ipfsRoots.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Roots", metadata.ipfsRoots);
+        }
+
+        outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        copyFileRange(dataFile, outputStream, rangeRequest.start, rangeRequest.length());
+        outputStream.flush();
+    }
+
+    /**
+     * Writes an HTTP 416 response for an unsatisfiable cached range request.
+     *
+     * @param socket target socket connected to WebView
+     * @param totalLength complete cached file length
+     * @throws IOException when the response cannot be written
+     */
+    private void writeRangeNotSatisfiableResponse(Socket socket, long totalLength) throws IOException {
+        BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
+        outputStream.write("HTTP/1.1 416 Range Not Satisfiable\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        writeHeader(outputStream, "Content-Range", "bytes */" + totalLength);
+        writeHeader(outputStream, "Content-Length", "0");
+        writeHeader(outputStream, "Connection", "close");
+        outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        outputStream.flush();
     }
 
     /**
@@ -1028,13 +1189,103 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * Decides whether the request can consult the persistent cache.
+     *
+     * @param request parsed WebView request
+     * @return true when a complete cached file could answer the request
+     */
+    private static boolean isCacheLookupRequest(HttpRequest request) {
+        return "GET".equals(request.method);
+    }
+
+    /**
      * Decides whether the request is safe for the simple complete-response cache.
      *
      * @param request parsed WebView request
      * @return true when the request can be cached only as a complete response
      */
     private static boolean isCompleteCacheRequest(HttpRequest request) {
-        return "GET".equals(request.method) && !request.headers.containsKey("range");
+        return "GET".equals(request.method) && !isRangeRequest(request);
+    }
+
+    /**
+     * Checks whether WebView requested a byte range.
+     *
+     * @param request parsed WebView request
+     * @return true when a Range header is present
+     */
+    private static boolean isRangeRequest(HttpRequest request) {
+        String range = request.headers.get("range");
+        return range != null && !range.trim().isEmpty();
+    }
+
+    /**
+     * Checks whether a Range request targets the main album audio class of files.
+     *
+     * @param request parsed WebView request
+     * @return true when the request should trigger complete background audio caching
+     */
+    private static boolean isAlbumAudioRangeRequest(HttpRequest request) {
+        String lowerPath = request.path.toLowerCase(Locale.ROOT);
+        return isRangeRequest(request)
+            && (lowerPath.endsWith(".m4a")
+                || lowerPath.endsWith(".mp3")
+                || lowerPath.endsWith(".aac")
+                || lowerPath.endsWith(".ogg")
+                || lowerPath.endsWith(".flac")
+                || lowerPath.endsWith(".wav"));
+    }
+
+    /**
+     * Parses one HTTP byte range against a complete local file length.
+     *
+     * @param rangeHeader raw Range header value
+     * @param totalLength complete cached file length
+     * @return parsed range, or null when the request is invalid or unsatisfiable
+     */
+    private static RangeRequest parseRangeRequest(String rangeHeader, long totalLength) {
+        if (rangeHeader == null || totalLength <= 0) {
+            return null;
+        }
+
+        String range = rangeHeader.trim().toLowerCase(Locale.ROOT);
+        if (!range.startsWith("bytes=") || range.indexOf(',') >= 0) {
+            return null;
+        }
+
+        String value = range.substring("bytes=".length()).trim();
+        int separator = value.indexOf('-');
+        if (separator < 0) {
+            return null;
+        }
+
+        try {
+            String startText = value.substring(0, separator).trim();
+            String endText = value.substring(separator + 1).trim();
+            long start;
+            long end;
+
+            if (startText.isEmpty()) {
+                long suffixLength = Long.parseLong(endText);
+                if (suffixLength <= 0) {
+                    return null;
+                }
+
+                start = Math.max(0, totalLength - suffixLength);
+                end = totalLength - 1;
+            } else {
+                start = Long.parseLong(startText);
+                end = endText.isEmpty() ? totalLength - 1 : Long.parseLong(endText);
+            }
+
+            if (start < 0 || end < start || start >= totalLength) {
+                return null;
+            }
+
+            return new RangeRequest(start, Math.min(end, totalLength - 1), totalLength);
+        } catch (NumberFormatException exception) {
+            return null;
+        }
     }
 
     /**
@@ -1088,6 +1339,33 @@ final class GatewayProxyServer implements Closeable {
     private static String safeTemporaryNamePart(String value) {
         String safeValue = value == null ? "cache" : value.toLowerCase(Locale.ROOT);
         return safeValue.replaceAll("[^a-z0-9_-]", "_");
+    }
+
+    /**
+     * Copies a selected byte range from one file to the response stream.
+     *
+     * @param file source file
+     * @param outputStream target response stream
+     * @param start first byte offset to copy
+     * @param length number of bytes to copy
+     * @throws IOException when file reading or response writing fails
+     */
+    private static void copyFileRange(File file, BufferedOutputStream outputStream, long start, long length) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        long remaining = length;
+
+        try (RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r")) {
+            randomAccessFile.seek(start);
+            while (remaining > 0) {
+                int read = randomAccessFile.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                if (read < 0) {
+                    return;
+                }
+
+                outputStream.write(buffer, 0, read);
+                remaining -= read;
+            }
+        }
     }
 
     /**
@@ -1229,6 +1507,37 @@ final class GatewayProxyServer implements Closeable {
             this.key = key;
             this.dataFile = dataFile;
             this.metaFile = metaFile;
+        }
+    }
+
+    /**
+     * One satisfiable byte range inside a complete cached file.
+     */
+    private static final class RangeRequest {
+        private final long start;
+        private final long end;
+        private final long totalLength;
+
+        /**
+         * Creates one byte range resolved against a complete cached file.
+         *
+         * @param start first requested byte offset
+         * @param end last requested byte offset
+         * @param totalLength complete cached file length
+         */
+        private RangeRequest(long start, long end, long totalLength) {
+            this.start = start;
+            this.end = end;
+            this.totalLength = totalLength;
+        }
+
+        /**
+         * Returns the number of bytes in this range.
+         *
+         * @return byte count to send
+         */
+        private long length() {
+            return end - start + 1;
         }
     }
 
