@@ -33,6 +33,9 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -48,6 +51,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * Main Android entry point for the single-album viewer.
@@ -88,6 +95,7 @@ public final class MainActivity extends Activity {
     private PendingDownload pendingDownload;
     private MediaSession mediaSession;
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService nativeZipExecutor = Executors.newSingleThreadExecutor();
     private final String mediaActionToken = UUID.randomUUID().toString();
     private String downloadBridgeScriptSource;
     private String mediaSessionBridgeScriptSource;
@@ -213,6 +221,7 @@ public final class MainActivity extends Activity {
         }
 
         artworkExecutor.shutdownNow();
+        nativeZipExecutor.shutdownNow();
 
         super.onDestroy();
     }
@@ -779,6 +788,29 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * Sends native ZIP progress back to the WebView download bridge.
+     *
+     * @param completedEntries number of finished ZIP entries
+     * @param expectedEntries expected number of ZIP entries
+     * @param currentEntry current ZIP entry path or empty text
+     */
+    private void dispatchNativeZipProgress(int completedEntries, int expectedEntries, String currentEntry) {
+        if (webView == null) {
+            return;
+        }
+
+        String script = "window.RPlayerGatewayNativeDownloadProgress && "
+            + "window.RPlayerGatewayNativeDownloadProgress.update("
+            + completedEntries
+            + ","
+            + expectedEntries
+            + ","
+            + jsString(currentEntry)
+            + ");";
+        runOnUiThread(() -> webView.evaluateJavascript(script, null));
+    }
+
+    /**
      * Updates Android's native MediaSession metadata.
      *
      * @param title current track title
@@ -910,8 +942,19 @@ public final class MainActivity extends Activity {
      */
     private boolean isLocalArtworkUrl(String artworkUrl) {
         return artworkUrl != null
+            && isLocalProxyAlbumUrl(artworkUrl);
+    }
+
+    /**
+     * Checks whether a source URL belongs to the current local proxy album root.
+     *
+     * @param sourceUrl source URL requested by a native helper
+     * @return true when the URL points to the local proxy album root
+     */
+    private boolean isLocalProxyAlbumUrl(String sourceUrl) {
+        return sourceUrl != null
             && !localProxyAlbumRootUrl.isEmpty()
-            && artworkUrl.startsWith(localProxyAlbumRootUrl);
+            && sourceUrl.startsWith(localProxyAlbumRootUrl);
     }
 
     /**
@@ -1311,7 +1354,11 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        closeQuietly(activeDownloadSession.outputStream);
+        if (activeDownloadSession.zipOutputStream != null) {
+            closeQuietly(activeDownloadSession.zipOutputStream);
+        } else {
+            closeQuietly(activeDownloadSession.outputStream);
+        }
         deleteTempFile(activeDownloadSession.file);
         activeDownloadSession = null;
     }
@@ -1360,6 +1407,45 @@ public final class MainActivity extends Activity {
         }
 
         return cleanName;
+    }
+
+    /**
+     * Sanitizes a RPlayer ZIP entry path before it is written by ZipOutputStream.
+     *
+     * @param path ZIP entry path requested by JavaScript
+     * @return safe relative ZIP entry path
+     */
+    private static String sanitizeZipEntryPath(String path) {
+        if (path == null) {
+            throw new IllegalArgumentException("ZIP entry path is empty.");
+        }
+
+        String normalizedPath = path.replace('\\', '/').trim();
+        while (normalizedPath.startsWith("/")) {
+            normalizedPath = normalizedPath.substring(1);
+        }
+
+        String[] parts = normalizedPath.split("/");
+        StringBuilder cleanPath = new StringBuilder();
+        for (String part : parts) {
+            String cleanPart = part.trim().replaceAll("[\\p{Cntrl}]", "_");
+            if (cleanPart.isEmpty() || ".".equals(cleanPart)) {
+                continue;
+            }
+            if ("..".equals(cleanPart)) {
+                throw new IllegalArgumentException("ZIP entry path contains parent traversal.");
+            }
+            if (cleanPath.length() > 0) {
+                cleanPath.append('/');
+            }
+            cleanPath.append(cleanPart);
+        }
+
+        if (cleanPath.length() == 0) {
+            throw new IllegalArgumentException("ZIP entry path is empty.");
+        }
+
+        return cleanPath.toString();
     }
 
     /**
@@ -1451,6 +1537,16 @@ public final class MainActivity extends Activity {
      */
     private final class DownloadBridge {
         /**
+         * Receives diagnostic messages from the JavaScript download bridge.
+         *
+         * @param message diagnostic message
+         */
+        @JavascriptInterface
+        public void log(String message) {
+            Log.i(LOG_TAG, "Download bridge: " + message);
+        }
+
+        /**
          * Starts a new temporary download file for a Blob generated inside WebView.
          *
          * @param downloadId JavaScript-generated identifier for this download
@@ -1477,6 +1573,300 @@ public final class MainActivity extends Activity {
                 Log.e(LOG_TAG, "Temporary download file could not be created.", exception);
                 showDownloadError("RPlayer Gateway Viewer could not create a temporary download file.");
             }
+        }
+
+        /**
+         * Starts a native ZIP file assembled from individual RPlayer entries.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         */
+        @JavascriptInterface
+        public synchronized void beginNativeZip(String downloadId) {
+            closeActiveDownloadSession();
+
+            try {
+                File file = File.createTempFile("rplayer-native-zip-", ".tmp", getCacheDir());
+                FileOutputStream outputStream = new FileOutputStream(file);
+                ZipOutputStream zipOutputStream = new ZipOutputStream(outputStream);
+                // RPlayer download packages already contain compressed media assets.
+                zipOutputStream.setLevel(Deflater.NO_COMPRESSION);
+
+                activeDownloadSession = new DownloadSession(
+                    downloadId,
+                    BuildConfig.DEFAULT_DOWNLOAD_FILE_NAME,
+                    "application/zip",
+                    0,
+                    file,
+                    outputStream,
+                    zipOutputStream
+                );
+
+                Log.i(LOG_TAG, "Native ZIP download started.");
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Native ZIP file could not be created.", exception);
+                showDownloadError("RPlayer Gateway Viewer could not create a native ZIP file.");
+            }
+        }
+
+        /**
+         * Stores the expected number of queued native ZIP entries for progress reporting.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param expectedEntries number of entries planned by the WebView bridge
+         */
+        @JavascriptInterface
+        public synchronized void setNativeZipExpectedEntries(String downloadId, int expectedEntries) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            activeDownloadSession.expectedZipEntries = Math.max(0, expectedEntries);
+            activeDownloadSession.completedZipEntries = 0;
+            reportNativeZipProgress(activeDownloadSession, "");
+        }
+
+        /**
+         * Adds a UTF-8 text file entry to the active native ZIP.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         * @param text UTF-8 text content
+         */
+        @JavascriptInterface
+        public void addNativeZipTextEntry(String downloadId, String path, String text) {
+            submitNativeZipTask(downloadId, "Native ZIP text entry could not be written.", session -> {
+                beginNativeZipEntryInternal(session, path);
+                byte[] data = (text == null ? "" : text).getBytes(StandardCharsets.UTF_8);
+                session.zipOutputStream.write(data);
+                session.receivedBytes += data.length;
+                finishNativeZipEntryInternal(session);
+                markNativeZipEntryFinished(session, path);
+            });
+        }
+
+        /**
+         * Streams a local proxy resource directly into one native ZIP entry.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         * @param sourceUrl local proxy source URL to stream from
+         */
+        @JavascriptInterface
+        public void addNativeZipSourceEntry(String downloadId, String path, String sourceUrl) {
+            if (!isLocalProxyAlbumUrl(sourceUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP source outside album proxy: " + sourceUrl);
+                failDownload(downloadId, "Native ZIP source is outside the album proxy.");
+                return;
+            }
+
+            submitNativeZipTask(downloadId, "Native ZIP source entry could not be written.", session -> {
+                HttpURLConnection connection = null;
+
+                try {
+                    beginNativeZipEntryInternal(session, path);
+                    connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+                    connection.setConnectTimeout(15000);
+                    connection.setReadTimeout(30000);
+
+                    int statusCode = connection.getResponseCode();
+                    if (statusCode < 200 || statusCode >= 300) {
+                        throw new IOException("Native ZIP source returned HTTP " + statusCode + ": " + sourceUrl);
+                    }
+
+                    try (InputStream inputStream = connection.getInputStream()) {
+                        byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                        int read;
+                        while ((read = inputStream.read(buffer)) >= 0) {
+                            session.zipOutputStream.write(buffer, 0, read);
+                            session.receivedBytes += read;
+                        }
+                    }
+
+                    finishNativeZipEntryInternal(session);
+                    markNativeZipEntryFinished(session, path);
+                    Log.i(LOG_TAG, "Native ZIP source entry finished: " + path + " <- " + sourceUrl);
+                } finally {
+                    if (connection != null) {
+                        connection.disconnect();
+                    }
+                }
+            });
+        }
+
+        /**
+         * Streams an MP3 file into one native ZIP entry with RPlayer ID3 metadata.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         * @param sourceUrl local proxy MP3 source URL to stream from
+         * @param metadataJson JSON-encoded track metadata and optional image URLs
+         */
+        @JavascriptInterface
+        public void addNativeZipTaggedMp3Entry(String downloadId, String path, String sourceUrl, String metadataJson) {
+            if (!isLocalProxyAlbumUrl(sourceUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP MP3 source outside album proxy: " + sourceUrl);
+                failDownload(downloadId, "Native ZIP MP3 source is outside the album proxy.");
+                return;
+            }
+
+            JSONObject metadata;
+            try {
+                metadata = new JSONObject(metadataJson == null ? "{}" : metadataJson);
+            } catch (JSONException exception) {
+                Log.e(LOG_TAG, "Native ZIP MP3 metadata could not be parsed.", exception);
+                failDownload(downloadId, "Native ZIP MP3 metadata could not be parsed.");
+                return;
+            }
+
+            String coverImageUrl = metadata.optString("coverImageUrl", "");
+            String iconImageUrl = metadata.optString("iconImageUrl", "");
+            if (!isBlank(coverImageUrl) && !isLocalProxyAlbumUrl(coverImageUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP MP3 cover outside album proxy: " + coverImageUrl);
+                failDownload(downloadId, "Native ZIP MP3 cover is outside the album proxy.");
+                return;
+            }
+
+            if (!isBlank(iconImageUrl) && !isLocalProxyAlbumUrl(iconImageUrl)) {
+                Log.w(LOG_TAG, "Blocked native ZIP MP3 icon outside album proxy: " + iconImageUrl);
+                failDownload(downloadId, "Native ZIP MP3 icon is outside the album proxy.");
+                return;
+            }
+
+            submitNativeZipTask(downloadId, "Native ZIP tagged MP3 entry could not be written.", session -> {
+                HttpURLConnection connection = null;
+
+                try {
+                    byte[] coverImage = readOptionalNativeZipBytes(coverImageUrl);
+                    byte[] iconImage = readOptionalNativeZipBytes(iconImageUrl);
+                    byte[] id3Tag = Id3TagWriter.buildTag(metadata, coverImage, iconImage);
+
+                    beginNativeZipEntryInternal(session, path);
+                    session.zipOutputStream.write(id3Tag);
+                    session.receivedBytes += id3Tag.length;
+
+                    connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+                    connection.setConnectTimeout(15000);
+                    connection.setReadTimeout(30000);
+
+                    int statusCode = connection.getResponseCode();
+                    if (statusCode < 200 || statusCode >= 300) {
+                        throw new IOException("Native ZIP MP3 source returned HTTP " + statusCode + ": " + sourceUrl);
+                    }
+
+                    try (InputStream inputStream = connection.getInputStream()) {
+                        byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                        session.receivedBytes += Id3TagWriter.copyMp3WithoutExistingTag(
+                            inputStream,
+                            session.zipOutputStream,
+                            buffer
+                        );
+                    }
+
+                    finishNativeZipEntryInternal(session);
+                    markNativeZipEntryFinished(session, path);
+                    Log.i(LOG_TAG, "Native ZIP tagged MP3 entry finished: " + path + " <- " + sourceUrl);
+                } finally {
+                    if (connection != null) {
+                        connection.disconnect();
+                    }
+                }
+            });
+        }
+
+        /**
+         * Starts a binary file entry in the active native ZIP.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param path ZIP entry path requested by RPlayer
+         */
+        @JavascriptInterface
+        public synchronized void beginNativeZipEntry(String downloadId, String path) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            try {
+                beginNativeZipEntryInternal(path);
+            } catch (IOException | IllegalArgumentException exception) {
+                Log.e(LOG_TAG, "Native ZIP entry could not be started.", exception);
+                failDownload(downloadId, "Native ZIP entry could not be started.");
+            }
+        }
+
+        /**
+         * Appends one Base64-encoded binary chunk to the current native ZIP entry.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param base64Chunk Base64-encoded binary payload
+         */
+        @JavascriptInterface
+        public synchronized void appendNativeZipEntryChunk(String downloadId, String base64Chunk) {
+            if (!isActiveNativeZip(downloadId) || activeDownloadSession.currentZipEntry == null) {
+                return;
+            }
+
+            try {
+                byte[] data = Base64.decode(base64Chunk, Base64.NO_WRAP);
+                activeDownloadSession.zipOutputStream.write(data);
+                activeDownloadSession.receivedBytes += data.length;
+            } catch (IOException | IllegalArgumentException exception) {
+                Log.e(LOG_TAG, "Native ZIP binary chunk could not be written.", exception);
+                failDownload(downloadId, "Native ZIP binary chunk could not be written.");
+            }
+        }
+
+        /**
+         * Finishes the current binary file entry in the active native ZIP.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         */
+        @JavascriptInterface
+        public synchronized void finishNativeZipEntry(String downloadId) {
+            if (!isActiveNativeZip(downloadId)) {
+                return;
+            }
+
+            try {
+                finishNativeZipEntryInternal();
+            } catch (IOException exception) {
+                Log.e(LOG_TAG, "Native ZIP entry could not be finalized.", exception);
+                failDownload(downloadId, "Native ZIP entry could not be finalized.");
+            }
+        }
+
+        /**
+         * Finalizes the native ZIP file and opens Android's save dialog.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param fileName suggested filename from RPlayer
+         */
+        @JavascriptInterface
+        public void finishNativeZip(String downloadId, String fileName) {
+            submitNativeZipTask(downloadId, "Native ZIP file could not be finalized.", session -> {
+                if (session.currentZipEntry != null) {
+                    session.zipOutputStream.closeEntry();
+                    session.currentZipEntry = null;
+                }
+                session.zipOutputStream.finish();
+                session.zipOutputStream.close();
+
+                synchronized (DownloadBridge.this) {
+                    if (activeDownloadSession == session) {
+                        activeDownloadSession = null;
+                    }
+                }
+
+                PendingDownload download = new PendingDownload(
+                    sanitizeFileName(fileName),
+                    session.mimeType,
+                    session.file
+                );
+                Log.i(LOG_TAG, "Native ZIP download finished: " + download.fileName
+                    + ", entries=" + session.zipEntryCount
+                    + ", bytes=" + session.receivedBytes);
+                reportNativeZipProgress(session, "");
+                runOnUiThread(() -> openSaveDialog(download));
+            });
         }
 
         /**
@@ -1549,6 +1939,13 @@ public final class MainActivity extends Activity {
             }
 
             Log.e(LOG_TAG, message == null ? "Generated ZIP download failed." : message);
+            if (activeDownloadSession.zipOutputStream != null) {
+                dispatchNativeZipProgress(
+                    -1,
+                    activeDownloadSession.expectedZipEntries,
+                    message == null ? "Native ZIP download failed." : message
+                );
+            }
             closeActiveDownloadSession();
             showDownloadError("RPlayer Gateway Viewer could not receive the generated ZIP file.");
         }
@@ -1564,6 +1961,201 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Checks whether a JavaScript callback belongs to the current native ZIP session.
+         *
+         * @param downloadId JavaScript-generated identifier to validate
+         * @return true when the callback belongs to an active native ZIP session
+         */
+        private boolean isActiveNativeZip(String downloadId) {
+            return isActiveDownload(downloadId) && activeDownloadSession.zipOutputStream != null;
+        }
+
+        /**
+         * Gets the active native ZIP session for a queued bridge call.
+         *
+         * @param downloadId JavaScript-generated identifier to validate
+         * @return active native ZIP session or null when the callback is stale
+         */
+        private synchronized DownloadSession activeNativeZipSession(String downloadId) {
+            if (!isActiveNativeZip(downloadId)) {
+                return null;
+            }
+
+            return activeDownloadSession;
+        }
+
+        /**
+         * Queues one native ZIP write task outside the WebView JavaScript bridge thread.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param failureMessage message used when the task fails
+         * @param task ZIP write task using the active download session
+         */
+        private void submitNativeZipTask(String downloadId, String failureMessage, NativeZipTask task) {
+            DownloadSession session = activeNativeZipSession(downloadId);
+            if (session == null) {
+                return;
+            }
+
+            try {
+                nativeZipExecutor.execute(() -> {
+                    if (!isSameActiveSession(session)) {
+                        return;
+                    }
+
+                    try {
+                        task.run(session);
+                    } catch (IOException | IllegalArgumentException exception) {
+                        Log.e(LOG_TAG, failureMessage, exception);
+                        failDownload(downloadId, failureMessage);
+                    }
+                });
+            } catch (RejectedExecutionException exception) {
+                Log.e(LOG_TAG, failureMessage, exception);
+                failDownload(downloadId, failureMessage);
+            }
+        }
+
+        /**
+         * Checks whether a queued native ZIP task still belongs to the active session.
+         *
+         * @param session queued task session
+         * @return true when the task may still write into the ZIP file
+         */
+        private synchronized boolean isSameActiveSession(DownloadSession session) {
+            return activeDownloadSession == session;
+        }
+
+        /**
+         * Opens a sanitized file entry in the active native ZIP.
+         *
+         * @param path ZIP entry path requested by RPlayer
+         * @throws IOException when the ZIP stream rejects the entry
+         */
+        private void beginNativeZipEntryInternal(String path) throws IOException {
+            beginNativeZipEntryInternal(activeDownloadSession, path);
+        }
+
+        /**
+         * Opens a sanitized file entry in the supplied native ZIP session.
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path requested by RPlayer
+         * @throws IOException when the ZIP stream rejects the entry
+         */
+        private void beginNativeZipEntryInternal(DownloadSession session, String path) throws IOException {
+            if (session.currentZipEntry != null) {
+                throw new IOException("Previous native ZIP entry is still open.");
+            }
+
+            String cleanPath = sanitizeZipEntryPath(path);
+            ZipEntry zipEntry = new ZipEntry(cleanPath);
+            session.zipOutputStream.putNextEntry(zipEntry);
+            session.currentZipEntry = cleanPath;
+            session.zipEntryCount += 1;
+            Log.i(LOG_TAG, "Native ZIP entry started: " + cleanPath);
+        }
+
+        /**
+         * Closes the currently open file entry in the active native ZIP.
+         *
+         * @throws IOException when the ZIP stream cannot close the entry
+         */
+        private void finishNativeZipEntryInternal() throws IOException {
+            finishNativeZipEntryInternal(activeDownloadSession);
+        }
+
+        /**
+         * Closes the currently open file entry in the supplied native ZIP session.
+         *
+         * @param session active native ZIP session
+         * @throws IOException when the ZIP stream cannot close the entry
+         */
+        private void finishNativeZipEntryInternal(DownloadSession session) throws IOException {
+            if (session.currentZipEntry == null) {
+                return;
+            }
+
+            session.zipOutputStream.closeEntry();
+            session.currentZipEntry = null;
+        }
+
+        /**
+         * Marks one queued native ZIP entry as complete and reports progress to JavaScript.
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path completed by the worker
+         */
+        private void markNativeZipEntryFinished(DownloadSession session, String path) {
+            session.completedZipEntries += 1;
+            reportNativeZipProgress(session, path);
+        }
+
+        /**
+         * Reports current native ZIP entry progress to JavaScript.
+         *
+         * @param session active native ZIP session
+         * @param currentEntry recently completed ZIP entry path
+         */
+        private void reportNativeZipProgress(DownloadSession session, String currentEntry) {
+            dispatchNativeZipProgress(
+                session.completedZipEntries,
+                session.expectedZipEntries,
+                currentEntry == null ? "" : currentEntry
+            );
+        }
+
+        /**
+         * Reads an optional local proxy resource fully for metadata embedding.
+         *
+         * @param sourceUrl local proxy URL or blank value
+         * @return resource bytes, or null when no resource was requested
+         * @throws IOException when the resource cannot be read
+         */
+        private byte[] readOptionalNativeZipBytes(String sourceUrl) throws IOException {
+            if (isBlank(sourceUrl)) {
+                return null;
+            }
+
+            HttpURLConnection connection = null;
+            try {
+                connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(30000);
+
+                int statusCode = connection.getResponseCode();
+                if (statusCode < 200 || statusCode >= 300) {
+                    throw new IOException("Native ZIP metadata resource returned HTTP " + statusCode + ": " + sourceUrl);
+                }
+
+                try (InputStream inputStream = connection.getInputStream()) {
+                    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                    byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                    int read;
+                    while ((read = inputStream.read(buffer)) >= 0) {
+                        outputStream.write(buffer, 0, read);
+                    }
+
+                    return outputStream.toByteArray();
+                }
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }
+
+        /**
+         * Checks whether a string is null, empty, or only whitespace.
+         *
+         * @param value checked string
+         * @return true when no meaningful value is present
+         */
+        private boolean isBlank(String value) {
+            return value == null || value.trim().isEmpty();
+        }
+
+        /**
          * Shows a download error from the UI thread.
          *
          * @param message message displayed over the WebView
@@ -1571,6 +2163,19 @@ public final class MainActivity extends Activity {
         private void showDownloadError(String message) {
             runOnUiThread(() -> showError(message));
         }
+    }
+
+    /**
+     * Background operation writing one entry into the active native ZIP session.
+     */
+    private interface NativeZipTask {
+        /**
+         * Writes one queued native ZIP operation.
+         *
+         * @param session active native ZIP session
+         * @throws IOException when the ZIP stream or source stream fails
+         */
+        void run(DownloadSession session) throws IOException;
     }
 
     /**
@@ -1583,8 +2188,13 @@ public final class MainActivity extends Activity {
         private final long totalBytes;
         private final File file;
         private final FileOutputStream outputStream;
+        private final ZipOutputStream zipOutputStream;
         private int nextChunkIndex;
         private long receivedBytes;
+        private int zipEntryCount;
+        private String currentZipEntry;
+        private int expectedZipEntries;
+        private int completedZipEntries;
 
         private DownloadSession(
             String downloadId,
@@ -1594,12 +2204,25 @@ public final class MainActivity extends Activity {
             File file,
             FileOutputStream outputStream
         ) {
+            this(downloadId, fileName, mimeType, totalBytes, file, outputStream, null);
+        }
+
+        private DownloadSession(
+            String downloadId,
+            String fileName,
+            String mimeType,
+            long totalBytes,
+            File file,
+            FileOutputStream outputStream,
+            ZipOutputStream zipOutputStream
+        ) {
             this.downloadId = downloadId;
             this.fileName = fileName;
             this.mimeType = mimeType;
             this.totalBytes = totalBytes;
             this.file = file;
             this.outputStream = outputStream;
+            this.zipOutputStream = zipOutputStream;
         }
     }
 
