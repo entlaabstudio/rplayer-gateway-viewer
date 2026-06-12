@@ -488,6 +488,53 @@
     }
 
     /**
+     * Escapes a string for safe use inside a regular expression.
+     *
+     * @param {string} value Raw string value.
+     * @returns {string} Escaped regular expression fragment.
+     */
+    function escapeRegExp(value) {
+        return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    /**
+     * Rewrites local proxy IPFS links in ID3 text metadata to canonical ipfs:// links.
+     *
+     * @param {*} value Metadata value to rewrite.
+     * @returns {*} Metadata value with stable IPFS links.
+     */
+    function rewriteId3IpfsLinks(value) {
+        var localIpfsRoot;
+        var localIpfsPattern;
+        var subdomainIpfsPattern;
+
+        if (Array.isArray(value)) {
+            return value.map(rewriteId3IpfsLinks);
+        }
+
+        if (value && typeof value === 'object') {
+            return Object.keys(value).reduce(function(result, key) {
+                result[key] = rewriteId3IpfsLinks(value[key]);
+                return result;
+            }, {});
+        }
+
+        if (typeof value !== 'string') {
+            return value;
+        }
+
+        localIpfsRoot = new URL('/ipfs/', document.baseURI).href;
+        localIpfsPattern = new RegExp(escapeRegExp(localIpfsRoot) + '([^\\s<>"\']+)', 'g');
+        subdomainIpfsPattern = /https?:\/\/([a-z0-9]+)\.ipfs\.localhost(?::\d+)?\/([^\s<>"']*)/g;
+
+        return value
+            .replace(localIpfsPattern, 'ipfs://$1')
+            .replace(subdomainIpfsPattern, function(match, cid, ipfsPath) {
+                return 'ipfs://' + cid + (ipfsPath ? '/' + ipfsPath : '');
+            });
+    }
+
+    /**
      * Builds native ID3 metadata for one RPlayer MP3 download entry.
      *
      * @param {object} downloads RPlayer downloads instance.
@@ -514,6 +561,8 @@
             isrc: entry.isrc || '',
             year: albumInfo.year || ''
         };
+
+        metadata = rewriteId3IpfsLinks(metadata);
 
         if (isBundleOptionChecked('ImagesToMp3') && entry.srcImgFile) {
             metadata.coverImageUrl = resolveSourceUrl(entry.srcImgFile);
