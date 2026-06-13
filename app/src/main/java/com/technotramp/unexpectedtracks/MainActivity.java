@@ -70,6 +70,7 @@ public final class MainActivity extends Activity {
     private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
     private static final long VIEWER_RETRY_DELAY_MS = 5000;
+    private static final long NATIVE_ZIP_RETRY_DELAY_MS = 5000;
     private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "music_player";
     private static final String DEFAULT_MEDIA_TITLE = BuildConfig.DEFAULT_MEDIA_TITLE;
     private static final String DEFAULT_MEDIA_ARTIST = BuildConfig.DEFAULT_MEDIA_ARTIST;
@@ -1761,20 +1762,12 @@ public final class MainActivity extends Activity {
             }
 
             submitNativeZipTask(downloadId, "Native ZIP source entry could not be written.", session -> {
-                HttpURLConnection connection = null;
+                File sourceFile = downloadNativeZipSourceToTempFile(session, path, sourceUrl);
 
                 try {
                     beginNativeZipEntryInternal(session, path);
-                    connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
-                    connection.setConnectTimeout(15000);
-                    connection.setReadTimeout(30000);
 
-                    int statusCode = connection.getResponseCode();
-                    if (statusCode < 200 || statusCode >= 300) {
-                        throw new IOException("Native ZIP source returned HTTP " + statusCode + ": " + sourceUrl);
-                    }
-
-                    try (InputStream inputStream = connection.getInputStream()) {
+                    try (InputStream inputStream = new FileInputStream(sourceFile)) {
                         byte[] buffer = new byte[COPY_BUFFER_SIZE];
                         int read;
                         while ((read = inputStream.read(buffer)) >= 0) {
@@ -1787,9 +1780,7 @@ public final class MainActivity extends Activity {
                     markNativeZipEntryFinished(session, path);
                     Log.i(LOG_TAG, "Native ZIP source entry finished: " + path + " <- " + sourceUrl);
                 } finally {
-                    if (connection != null) {
-                        connection.disconnect();
-                    }
+                    deleteTempFile(sourceFile);
                 }
             });
         }
@@ -1834,27 +1825,18 @@ public final class MainActivity extends Activity {
             }
 
             submitNativeZipTask(downloadId, "Native ZIP tagged MP3 entry could not be written.", session -> {
-                HttpURLConnection connection = null;
+                File sourceFile = downloadNativeZipSourceToTempFile(session, path, sourceUrl);
 
                 try {
-                    byte[] coverImage = readOptionalNativeZipBytes(coverImageUrl);
-                    byte[] iconImage = readOptionalNativeZipBytes(iconImageUrl);
+                    byte[] coverImage = readOptionalNativeZipBytes(session, coverImageUrl, "metadata cover image");
+                    byte[] iconImage = readOptionalNativeZipBytes(session, iconImageUrl, "metadata icon image");
                     byte[] id3Tag = Id3TagWriter.buildTag(metadata, coverImage, iconImage);
 
                     beginNativeZipEntryInternal(session, path);
                     session.zipOutputStream.write(id3Tag);
                     session.receivedBytes += id3Tag.length;
 
-                    connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
-                    connection.setConnectTimeout(15000);
-                    connection.setReadTimeout(30000);
-
-                    int statusCode = connection.getResponseCode();
-                    if (statusCode < 200 || statusCode >= 300) {
-                        throw new IOException("Native ZIP MP3 source returned HTTP " + statusCode + ": " + sourceUrl);
-                    }
-
-                    try (InputStream inputStream = connection.getInputStream()) {
+                    try (InputStream inputStream = new FileInputStream(sourceFile)) {
                         byte[] buffer = new byte[COPY_BUFFER_SIZE];
                         session.receivedBytes += Id3TagWriter.copyMp3WithoutExistingTag(
                             inputStream,
@@ -1867,9 +1849,7 @@ public final class MainActivity extends Activity {
                     markNativeZipEntryFinished(session, path);
                     Log.i(LOG_TAG, "Native ZIP tagged MP3 entry finished: " + path + " <- " + sourceUrl);
                 } finally {
-                    if (connection != null) {
-                        connection.disconnect();
-                    }
+                    deleteTempFile(sourceFile);
                 }
             });
         }
@@ -2213,36 +2193,168 @@ public final class MainActivity extends Activity {
          * @return resource bytes, or null when no resource was requested
          * @throws IOException when the resource cannot be read
          */
-        private byte[] readOptionalNativeZipBytes(String sourceUrl) throws IOException {
+        private byte[] readOptionalNativeZipBytes(DownloadSession session, String sourceUrl, String label) throws IOException {
             if (isBlank(sourceUrl)) {
                 return null;
             }
 
-            HttpURLConnection connection = null;
-            try {
-                connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
-                connection.setConnectTimeout(15000);
-                connection.setReadTimeout(30000);
+            File sourceFile = downloadNativeZipSourceToTempFile(session, label, sourceUrl);
 
-                int statusCode = connection.getResponseCode();
-                if (statusCode < 200 || statusCode >= 300) {
-                    throw new IOException("Native ZIP metadata resource returned HTTP " + statusCode + ": " + sourceUrl);
+            try (InputStream inputStream = new FileInputStream(sourceFile)) {
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                int read;
+                while ((read = inputStream.read(buffer)) >= 0) {
+                    outputStream.write(buffer, 0, read);
                 }
 
-                try (InputStream inputStream = connection.getInputStream()) {
-                    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                    byte[] buffer = new byte[COPY_BUFFER_SIZE];
-                    int read;
-                    while ((read = inputStream.read(buffer)) >= 0) {
-                        outputStream.write(buffer, 0, read);
+                return outputStream.toByteArray();
+            } finally {
+                deleteTempFile(sourceFile);
+            }
+        }
+
+        /**
+         * Downloads one source file completely before it is written into the ZIP.
+         *
+         * <p>This keeps the ZIP stream valid when the gateway or network disappears
+         * in the middle of a source file.</p>
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path or diagnostic label
+         * @param sourceUrl local proxy source URL
+         * @return temporary file containing a complete source response
+         * @throws IOException when the source cannot be downloaded or the session ends
+         */
+        private File downloadNativeZipSourceToTempFile(DownloadSession session, String path, String sourceUrl) throws IOException {
+            int attempt = 1;
+
+            while (true) {
+                File sourceFile = File.createTempFile("rplayer-native-source-", ".tmp", getCacheDir());
+                HttpURLConnection connection = null;
+
+                try {
+                    connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+                    connection.setConnectTimeout(15000);
+                    connection.setReadTimeout(30000);
+
+                    int statusCode = connection.getResponseCode();
+                    if (statusCode < 200 || statusCode >= 300) {
+                        IOException exception = new IOException(
+                            "Native ZIP source returned HTTP " + statusCode + ": " + sourceUrl
+                        );
+
+                        if (!isRetryableNativeZipStatus(statusCode)) {
+                            throw exception;
+                        }
+
+                        throw new RetryableNativeZipSourceException(exception);
                     }
 
-                    return outputStream.toByteArray();
+                    try (
+                        InputStream inputStream = connection.getInputStream();
+                        OutputStream outputStream = new FileOutputStream(sourceFile)
+                    ) {
+                        byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                        int read;
+                        while ((read = inputStream.read(buffer)) >= 0) {
+                            outputStream.write(buffer, 0, read);
+                        }
+                    }
+
+                    return sourceFile;
+                } catch (RetryableNativeZipSourceException exception) {
+                    deleteTempFile(sourceFile);
+                    waitBeforeNativeZipRetry(session, path, sourceUrl, attempt, exception.getCause());
+                    attempt += 1;
+                } catch (IOException exception) {
+                    deleteTempFile(sourceFile);
+
+                    if (isStorageFailure(exception)) {
+                        throw exception;
+                    }
+
+                    waitBeforeNativeZipRetry(session, path, sourceUrl, attempt, exception);
+                    attempt += 1;
+                } finally {
+                    if (connection != null) {
+                        connection.disconnect();
+                    }
                 }
-            } finally {
-                if (connection != null) {
-                    connection.disconnect();
-                }
+            }
+        }
+
+        /**
+         * Checks whether an HTTP status is likely to be temporary during downloads.
+         *
+         * @param statusCode HTTP status returned by the local proxy
+         * @return true when the source should be retried instead of failing the ZIP
+         */
+        private boolean isRetryableNativeZipStatus(int statusCode) {
+            return statusCode == 408
+                || statusCode == 429
+                || statusCode == 502
+                || statusCode == 503
+                || statusCode == 504;
+        }
+
+        /**
+         * Checks whether a download failure is probably local storage exhaustion.
+         *
+         * @param exception failure raised while downloading one ZIP source
+         * @return true when retrying would likely loop forever
+         */
+        private boolean isStorageFailure(IOException exception) {
+            String message = exception.getMessage();
+            if (message == null) {
+                return false;
+            }
+
+            String lowerMessage = message.toLowerCase(java.util.Locale.ROOT);
+            return lowerMessage.contains("no space") || lowerMessage.contains("enospc");
+        }
+
+        /**
+         * Waits before retrying a temporarily unavailable ZIP source.
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path or diagnostic label
+         * @param sourceUrl local proxy source URL
+         * @param attempt retry attempt number
+         * @param failure failure that triggered the retry
+         * @throws IOException when the wait is interrupted or the session is gone
+         */
+        private void waitBeforeNativeZipRetry(
+            DownloadSession session,
+            String path,
+            String sourceUrl,
+            int attempt,
+            Throwable failure
+        ) throws IOException {
+            if (!isSameActiveSession(session)) {
+                throw new IOException("Native ZIP session is no longer active.");
+            }
+
+            String currentEntry = "Waiting for connection: " + path;
+            Log.w(
+                LOG_TAG,
+                "Native ZIP source unavailable, retrying after wait. attempt="
+                    + attempt
+                    + ", path=" + path
+                    + ", source=" + sourceUrl,
+                failure
+            );
+            dispatchNativeZipProgress(session.completedZipEntries, session.expectedZipEntries, currentEntry);
+
+            try {
+                Thread.sleep(NATIVE_ZIP_RETRY_DELAY_MS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Native ZIP retry wait was interrupted.", exception);
+            }
+
+            if (!isSameActiveSession(session)) {
+                throw new IOException("Native ZIP session is no longer active.");
             }
         }
 
@@ -2263,6 +2375,15 @@ public final class MainActivity extends Activity {
          */
         private void showDownloadError(String message) {
             runOnUiThread(() -> showError(message));
+        }
+    }
+
+    /**
+     * Marker exception used when a ZIP source failure should be retried.
+     */
+    private static final class RetryableNativeZipSourceException extends IOException {
+        private RetryableNativeZipSourceException(IOException cause) {
+            super(cause);
         }
     }
 
