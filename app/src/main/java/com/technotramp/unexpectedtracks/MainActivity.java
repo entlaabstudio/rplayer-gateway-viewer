@@ -16,6 +16,8 @@ import android.media.session.PlaybackState;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
 import android.view.View;
@@ -67,6 +69,7 @@ public final class MainActivity extends Activity {
     private static final int CREATE_DOWNLOAD_REQUEST_CODE = 1001;
     private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
+    private static final long VIEWER_RETRY_DELAY_MS = 5000;
     private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "music_player";
     private static final String DEFAULT_MEDIA_TITLE = BuildConfig.DEFAULT_MEDIA_TITLE;
     private static final String DEFAULT_MEDIA_ARTIST = BuildConfig.DEFAULT_MEDIA_ARTIST;
@@ -111,7 +114,26 @@ public final class MainActivity extends Activity {
     private long currentMediaDurationMs = -1;
     private int currentPlaybackState = PlaybackState.STATE_NONE;
     private boolean playbackForegroundServiceActive;
+    private boolean mainFrameLoadFailed;
+    private boolean viewerRetryPending;
     private Toast missingExternalAppToast;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable viewerRetryRunnable = new Runnable() {
+        /**
+         * Retries the current viewer load after a retryable startup failure.
+         */
+        @Override
+        public void run() {
+            viewerRetryPending = false;
+
+            if (webView == null) {
+                return;
+            }
+
+            Log.i(LOG_TAG, "Retrying viewer load after temporary gateway failure.");
+            webView.reload();
+        }
+    };
 
     /**
      * Initializes the activity, starts the local proxy, and loads the viewer URL.
@@ -197,6 +219,7 @@ public final class MainActivity extends Activity {
      */
     @Override
     protected void onDestroy() {
+        mainHandler.removeCallbacks(viewerRetryRunnable);
         closeActiveDownloadSession();
         cancelMissingExternalAppToast();
         stopPlaybackForegroundService();
@@ -375,6 +398,10 @@ public final class MainActivity extends Activity {
                         + ", url=" + request.getUrl()
                         + ", mainFrame=" + request.isForMainFrame()
                 );
+
+                if (isRetryableViewerFailure(request)) {
+                    scheduleViewerRetry("WebView resource error: " + error.getDescription());
+                }
             }
 
             @Override
@@ -388,18 +415,35 @@ public final class MainActivity extends Activity {
                         + ", url=" + request.getUrl()
                         + ", mainFrame=" + request.isForMainFrame()
                 );
+
+                if (isRetryableViewerFailure(request) && errorResponse.getStatusCode() >= 500) {
+                    scheduleViewerRetry("WebView HTTP error: " + errorResponse.getStatusCode());
+                }
             }
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
                 Log.i(LOG_TAG, "WebView page started: " + url);
+
+                if (isLocalProxyAlbumUri(Uri.parse(url)) && !viewerRetryPending) {
+                    mainFrameLoadFailed = false;
+                }
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 Log.i(LOG_TAG, "WebView page finished: " + url);
+
+                if (isLocalProxyAlbumUri(Uri.parse(url)) && !mainFrameLoadFailed) {
+                    cancelViewerRetry();
+                }
+
+                if (mainFrameLoadFailed) {
+                    return;
+                }
+
                 injectDownloadBridge();
                 injectMediaSessionBridge();
                 injectDisplayModeBridge();
@@ -448,6 +492,45 @@ public final class MainActivity extends Activity {
 
         String localProxyOrigin = localProxyAlbumRootUrl.substring(0, localProxyAlbumRootUrl.indexOf("/ipfs/"));
         return uri.toString().startsWith(localProxyOrigin + "/__rplayer_gateway/");
+    }
+
+
+    /**
+     * Checks whether a failed WebView request is the main local viewer page.
+     *
+     * @param request failed WebView request.
+     * @return true when the failure should keep retrying instead of becoming final.
+     */
+    private boolean isRetryableViewerFailure(WebResourceRequest request) {
+        return request != null && request.isForMainFrame() && isLocalProxyAlbumUri(request.getUrl());
+    }
+
+    /**
+     * Shows a waiting state and schedules a modest retry of the viewer page.
+     *
+     * @param reason diagnostic reason written to logcat.
+     */
+    private void scheduleViewerRetry(String reason) {
+        mainFrameLoadFailed = true;
+        errorView.setText("Waiting for IPFS gateway connection...\nThe viewer will continue automatically.");
+        errorView.setVisibility(TextView.VISIBLE);
+
+        if (viewerRetryPending) {
+            return;
+        }
+
+        viewerRetryPending = true;
+        Log.i(LOG_TAG, "Viewer load will retry: " + reason);
+        mainHandler.postDelayed(viewerRetryRunnable, VIEWER_RETRY_DELAY_MS);
+    }
+
+    /**
+     * Clears the waiting state after the viewer page loads successfully.
+     */
+    private void cancelViewerRetry() {
+        viewerRetryPending = false;
+        mainHandler.removeCallbacks(viewerRetryRunnable);
+        errorView.setVisibility(TextView.GONE);
     }
 
     /**
