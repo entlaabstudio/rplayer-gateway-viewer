@@ -48,6 +48,7 @@ final class GatewayProxyServer implements Closeable {
     private static final String IPFS_ROOT_PATH = "/ipfs/" + IPFS_CID + "/";
     private static final String ROOT_PATH = IPFS_ROOT_PATH + ENTRY_FILE;
     private static final String RPLAYER_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.js";
+    private static final String RPLAYER_CORE_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.core.js";
     private static final String RPLAYER_VISUAL_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.visual.js";
     private static final int BUFFER_SIZE = 32 * 1024;
     private static final long SLOW_REQUEST_LOG_THRESHOLD_MS = 5000;
@@ -96,6 +97,15 @@ final class GatewayProxyServer implements Closeable {
      */
     String viewerUrl() {
         return localOrigin() + ROOT_PATH;
+    }
+
+    /**
+     * Builds the local URL for direct RPlayer startup after the boot loader has succeeded once.
+     *
+     * @return local proxy URL for the configured RPlayer document
+     */
+    String rplayerUrl() {
+        return localOrigin() + IPFS_ROOT_PATH + BuildConfig.RPLAYER_INDEX_FILE;
     }
 
     /**
@@ -391,6 +401,7 @@ final class GatewayProxyServer implements Closeable {
     private boolean shouldTransformTextResponse(HttpRequest request, int statusCode, String contentType) {
         return shouldInjectHtmlBridge(request, statusCode, contentType)
             || shouldPatchRPlayerScript(request, statusCode)
+            || shouldPatchRPlayerCoreScript(request, statusCode)
             || shouldPatchRPlayerVisualScript(request, statusCode);
     }
 
@@ -409,6 +420,10 @@ final class GatewayProxyServer implements Closeable {
             return patchRPlayerScript(text).getBytes(StandardCharsets.UTF_8);
         }
 
+        if (shouldPatchRPlayerCoreScript(request, 200)) {
+            return patchRPlayerCoreScript(text).getBytes(StandardCharsets.UTF_8);
+        }
+
         if (shouldPatchRPlayerVisualScript(request, 200)) {
             return patchRPlayerVisualScript(text).getBytes(StandardCharsets.UTF_8);
         }
@@ -425,6 +440,17 @@ final class GatewayProxyServer implements Closeable {
      */
     private static boolean shouldPatchRPlayerScript(HttpRequest request, int statusCode) {
         return statusCode == 200 && RPLAYER_SCRIPT_PATH.equals(request.path);
+    }
+
+    /**
+     * Checks whether the core RPlayer module should notify the wrapper after successful initialization.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @return true when rplayer.core.js should be patched
+     */
+    private static boolean shouldPatchRPlayerCoreScript(HttpRequest request, int statusCode) {
+        return statusCode == 200 && RPLAYER_CORE_SCRIPT_PATH.equals(request.path);
     }
 
     /**
@@ -454,6 +480,28 @@ final class GatewayProxyServer implements Closeable {
         }
 
         Log.i(LOG_TAG, "RPlayer downloads instance exposed to viewer bridge.");
+        return script.replace(original, patched);
+    }
+
+    /**
+     * Notifies the Android wrapper when immutable RPlayer content reaches real initialization.
+     *
+     * @param script original rplayer.core.js source
+     * @return patched script source served only through the local proxy
+     */
+    private static String patchRPlayerCoreScript(String script) {
+        String original = "                that.init();";
+        String patched = original + "\n"
+            + "                if (window.RPlayerGatewayBootNative) {" + "\n"
+            + "                    window.RPlayerGatewayBootNative.markRPlayerInitialized();" + "\n"
+            + "                }";
+
+        if (!script.contains(original)) {
+            Log.w(LOG_TAG, "RPlayer initialization patch target was not found.");
+            return script;
+        }
+
+        Log.i(LOG_TAG, "RPlayer initialization signal patch applied.");
         return script.replace(original, patched);
     }
 
