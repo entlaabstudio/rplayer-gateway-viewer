@@ -107,6 +107,36 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * Resolves one local proxy URL to an already verified persistent cache file.
+     *
+     * @param localUrl local proxy URL requested by the native downloader
+     * @return cached response body, or null when the URL is not cached and verified
+     */
+    File cachedFileForLocalUrl(String localUrl) {
+        try {
+            URL url = new URL(localUrl);
+            if (!"127.0.0.1".equals(url.getHost()) || url.getPort() != serverSocket.getLocalPort()) {
+                return null;
+            }
+
+            String path = url.getPath();
+            if (!isSafeAlbumPath(path)) {
+                return null;
+            }
+
+            CacheEntry cacheEntry = cacheEntryFor(path);
+            CacheMetadata metadata = CacheMetadata.load(cacheEntry.metaFile);
+            if (!cacheEntry.dataFile.isFile() || metadata == null || !isCacheEntryValid(cacheEntry, metadata)) {
+                return null;
+            }
+
+            return cacheEntry.dataFile;
+        } catch (IOException exception) {
+            return null;
+        }
+    }
+
+    /**
      * Builds the local origin selected for this proxy instance.
      *
      * @return local HTTP origin with the selected random port

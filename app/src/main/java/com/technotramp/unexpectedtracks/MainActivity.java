@@ -54,6 +54,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.zip.CRC32;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -1762,12 +1763,12 @@ public final class MainActivity extends Activity {
             }
 
             submitNativeZipTask(downloadId, "Native ZIP source entry could not be written.", session -> {
-                File sourceFile = downloadNativeZipSourceToTempFile(session, path, sourceUrl);
+                NativeZipSourceFile sourceFile = nativeZipSourceFile(session, path, sourceUrl);
 
                 try {
-                    beginNativeZipEntryInternal(session, path);
+                    beginNativeZipStoredEntryInternal(session, path, sourceFile.file);
 
-                    try (InputStream inputStream = new FileInputStream(sourceFile)) {
+                    try (InputStream inputStream = new FileInputStream(sourceFile.file)) {
                         byte[] buffer = new byte[COPY_BUFFER_SIZE];
                         int read;
                         while ((read = inputStream.read(buffer)) >= 0) {
@@ -1780,7 +1781,9 @@ public final class MainActivity extends Activity {
                     markNativeZipEntryFinished(session, path);
                     Log.i(LOG_TAG, "Native ZIP source entry finished: " + path + " <- " + sourceUrl);
                 } finally {
-                    deleteTempFile(sourceFile);
+                    if (sourceFile.temporary) {
+                        deleteTempFile(sourceFile.file);
+                    }
                 }
             });
         }
@@ -2138,6 +2141,52 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Opens a stored ZIP entry for an already materialized binary source file.
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path requested by RPlayer
+         * @param sourceFile complete source file that will be copied into the entry
+         * @throws IOException when the ZIP stream rejects the entry or the source cannot be read
+         */
+        private void beginNativeZipStoredEntryInternal(DownloadSession session, String path, File sourceFile) throws IOException {
+            if (session.currentZipEntry != null) {
+                throw new IOException("Previous native ZIP entry is still open.");
+            }
+
+            String cleanPath = sanitizeZipEntryPath(path);
+            ZipEntry zipEntry = new ZipEntry(cleanPath);
+            long size = sourceFile.length();
+            zipEntry.setMethod(ZipEntry.STORED);
+            zipEntry.setSize(size);
+            zipEntry.setCompressedSize(size);
+            zipEntry.setCrc(crc32(sourceFile));
+            session.zipOutputStream.putNextEntry(zipEntry);
+            session.currentZipEntry = cleanPath;
+            session.zipEntryCount += 1;
+            Log.i(LOG_TAG, "Native ZIP stored entry started: " + cleanPath + ", bytes=" + size);
+        }
+
+        /**
+         * Calculates CRC-32 required by the ZIP stored entry format.
+         *
+         * @param file complete source file to describe in the ZIP central directory
+         * @return unsigned CRC-32 value expected by ZipEntry
+         * @throws IOException when the source file cannot be read
+         */
+        private long crc32(File file) throws IOException {
+            CRC32 crc32 = new CRC32();
+            try (InputStream inputStream = new FileInputStream(file)) {
+                byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                int read;
+                while ((read = inputStream.read(buffer)) >= 0) {
+                    crc32.update(buffer, 0, read);
+                }
+            }
+
+            return crc32.getValue();
+        }
+
+        /**
          * Closes the currently open file entry in the active native ZIP.
          *
          * @throws IOException when the ZIP stream cannot close the entry
@@ -2285,6 +2334,25 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Finds a verified persistent source file before falling back to a temporary download.
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path or diagnostic label
+         * @param sourceUrl local proxy source URL
+         * @return source file and whether it should be deleted after the ZIP entry is written
+         * @throws IOException when the source cannot be downloaded or the session ends
+         */
+        private NativeZipSourceFile nativeZipSourceFile(DownloadSession session, String path, String sourceUrl) throws IOException {
+            File cachedFile = proxyServer == null ? null : proxyServer.cachedFileForLocalUrl(sourceUrl);
+            if (cachedFile != null) {
+                Log.i(LOG_TAG, "Native ZIP source uses persistent cache: " + path + " <- " + sourceUrl);
+                return new NativeZipSourceFile(cachedFile, false);
+            }
+
+            return new NativeZipSourceFile(downloadNativeZipSourceToTempFile(session, path, sourceUrl), true);
+        }
+
+        /**
          * Checks whether an HTTP status is likely to be temporary during downloads.
          *
          * @param statusCode HTTP status returned by the local proxy
@@ -2398,6 +2466,25 @@ public final class MainActivity extends Activity {
          * @throws IOException when the ZIP stream or source stream fails
          */
         void run(DownloadSession session) throws IOException;
+    }
+
+    /**
+     * Describes one native ZIP source file and its ownership.
+     */
+    private final class NativeZipSourceFile {
+        private final File file;
+        private final boolean temporary;
+
+        /**
+         * Creates a source file descriptor for native ZIP writing.
+         *
+         * @param file complete file to copy into the ZIP entry
+         * @param temporary true when the file must be deleted after use
+         */
+        private NativeZipSourceFile(File file, boolean temporary) {
+            this.file = file;
+            this.temporary = temporary;
+        }
     }
 
     /**
