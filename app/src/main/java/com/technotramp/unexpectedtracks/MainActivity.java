@@ -68,6 +68,7 @@ import java.util.zip.ZipOutputStream;
 public final class MainActivity extends Activity {
     private static final String LOG_TAG = "RPlayerViewer";
     private static final int CREATE_DOWNLOAD_REQUEST_CODE = 1001;
+    private static final int CREATE_NATIVE_ZIP_REQUEST_CODE = 1002;
     private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
     private static final long VIEWER_RETRY_DELAY_MS = 5000;
@@ -98,6 +99,7 @@ public final class MainActivity extends Activity {
     private TextView errorView;
     private DownloadSession activeDownloadSession;
     private PendingDownload pendingDownload;
+    private PendingNativeZip pendingNativeZip;
     private MediaSession mediaSession;
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService nativeZipExecutor = Executors.newSingleThreadExecutor();
@@ -181,6 +183,11 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == CREATE_NATIVE_ZIP_REQUEST_CODE) {
+            handleNativeZipDestinationResult(resultCode, data);
+            return;
+        }
 
         if (requestCode != CREATE_DOWNLOAD_REQUEST_CODE) {
             return;
@@ -1426,6 +1433,116 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * Opens Android's system save dialog before the native ZIP is written.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending ZIP session
+     * @param fileName suggested ZIP filename
+     */
+    private void openNativeZipSaveDialog(String downloadId, String fileName) {
+        pendingNativeZip = new PendingNativeZip(downloadId, sanitizeFileName(fileName));
+
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/zip");
+        intent.putExtra(Intent.EXTRA_TITLE, pendingNativeZip.fileName);
+
+        try {
+            startActivityForResult(intent, CREATE_NATIVE_ZIP_REQUEST_CODE);
+        } catch (ActivityNotFoundException exception) {
+            Log.e(LOG_TAG, "Android native ZIP save dialog is not available.", exception);
+            notifyNativeZipDestinationCanceled(downloadId);
+            pendingNativeZip = null;
+            showError("Android save dialog is not available.");
+        }
+    }
+
+    /**
+     * Starts native ZIP streaming after Android returns the selected output URI.
+     *
+     * @param resultCode Android activity result code
+     * @param data Android activity result data containing the selected URI
+     */
+    private void handleNativeZipDestinationResult(int resultCode, Intent data) {
+        PendingNativeZip pendingZip = pendingNativeZip;
+        pendingNativeZip = null;
+
+        if (pendingZip == null) {
+            return;
+        }
+
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            notifyNativeZipDestinationCanceled(pendingZip.downloadId);
+            return;
+        }
+
+        try {
+            OutputStream outputStream = getContentResolver().openOutputStream(data.getData());
+            if (outputStream == null) {
+                throw new IOException("Android returned no output stream for the selected native ZIP destination.");
+            }
+
+            ZipOutputStream zipOutputStream = new ZipOutputStream(outputStream);
+            // RPlayer download packages already contain compressed media assets.
+            zipOutputStream.setLevel(Deflater.NO_COMPRESSION);
+
+            synchronized (this) {
+                closeActiveDownloadSession();
+                activeDownloadSession = new DownloadSession(
+                    pendingZip.downloadId,
+                    pendingZip.fileName,
+                    "application/zip",
+                    0,
+                    null,
+                    outputStream,
+                    zipOutputStream
+                );
+            }
+
+            Log.i(LOG_TAG, "Native ZIP direct download started: " + pendingZip.fileName);
+            notifyNativeZipDestinationReady(pendingZip.downloadId);
+        } catch (IOException exception) {
+            Log.e(LOG_TAG, "Native ZIP destination could not be opened.", exception);
+            notifyNativeZipDestinationCanceled(pendingZip.downloadId);
+            showError("RPlayer Gateway Viewer could not open the selected ZIP file.");
+        }
+    }
+
+    /**
+     * Notifies JavaScript that the native ZIP destination is ready for queued entries.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending ZIP session
+     */
+    private void notifyNativeZipDestinationReady(String downloadId) {
+        evaluateDownloadScript("window.RPlayerGatewayNativeZipDestinationReady && window.RPlayerGatewayNativeZipDestinationReady("
+            + JSONObject.quote(downloadId)
+            + ");");
+    }
+
+    /**
+     * Notifies JavaScript that the native ZIP destination was canceled or failed.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending ZIP session
+     */
+    private void notifyNativeZipDestinationCanceled(String downloadId) {
+        evaluateDownloadScript("window.RPlayerGatewayNativeZipDestinationCanceled && window.RPlayerGatewayNativeZipDestinationCanceled("
+            + JSONObject.quote(downloadId)
+            + ");");
+    }
+
+    /**
+     * Runs a small JavaScript callback in the WebView when it is still available.
+     *
+     * @param script JavaScript source to evaluate
+     */
+    private void evaluateDownloadScript(String script) {
+        if (webView == null) {
+            return;
+        }
+
+        webView.evaluateJavascript(script, null);
+    }
+
+    /**
      * Copies a temporary generated ZIP to the document URI selected by the user.
      *
      * @param download completed temporary download to copy
@@ -1640,6 +1757,17 @@ public final class MainActivity extends Activity {
      */
     private final class DownloadBridge {
         /**
+         * Opens the Android save dialog before native ZIP streaming starts.
+         *
+         * @param downloadId JavaScript-generated identifier for this ZIP build
+         * @param fileName suggested output ZIP filename
+         */
+        @JavascriptInterface
+        public void requestNativeZipDestination(String downloadId, String fileName) {
+            runOnUiThread(() -> openNativeZipSaveDialog(downloadId, fileName));
+        }
+
+        /**
          * Receives diagnostic messages from the JavaScript download bridge.
          *
          * @param message diagnostic message
@@ -1685,6 +1813,11 @@ public final class MainActivity extends Activity {
          */
         @JavascriptInterface
         public synchronized void beginNativeZip(String downloadId) {
+            if (isActiveNativeZip(downloadId)) {
+                Log.i(LOG_TAG, "Native ZIP direct stream confirmed.");
+                return;
+            }
+
             closeActiveDownloadSession();
 
             try {
@@ -1919,7 +2052,7 @@ public final class MainActivity extends Activity {
         }
 
         /**
-         * Finalizes the native ZIP file and opens Android's save dialog.
+         * Finalizes the native ZIP file written to the selected Android document.
          *
          * @param downloadId JavaScript-generated identifier for this ZIP build
          * @param fileName suggested filename from RPlayer
@@ -1940,16 +2073,10 @@ public final class MainActivity extends Activity {
                     }
                 }
 
-                PendingDownload download = new PendingDownload(
-                    sanitizeFileName(fileName),
-                    session.mimeType,
-                    session.file
-                );
-                Log.i(LOG_TAG, "Native ZIP download finished: " + download.fileName
+                Log.i(LOG_TAG, "Native ZIP download finished: " + sanitizeFileName(fileName)
                     + ", entries=" + session.zipEntryCount
                     + ", bytes=" + session.receivedBytes);
                 reportNativeZipProgress(session, "");
-                runOnUiThread(() -> openSaveDialog(download));
             });
         }
 
@@ -2496,7 +2623,7 @@ public final class MainActivity extends Activity {
         private final String mimeType;
         private final long totalBytes;
         private final File file;
-        private final FileOutputStream outputStream;
+        private final OutputStream outputStream;
         private final ZipOutputStream zipOutputStream;
         private int nextChunkIndex;
         private long receivedBytes;
@@ -2511,7 +2638,7 @@ public final class MainActivity extends Activity {
             String mimeType,
             long totalBytes,
             File file,
-            FileOutputStream outputStream
+            OutputStream outputStream
         ) {
             this(downloadId, fileName, mimeType, totalBytes, file, outputStream, null);
         }
@@ -2522,7 +2649,7 @@ public final class MainActivity extends Activity {
             String mimeType,
             long totalBytes,
             File file,
-            FileOutputStream outputStream,
+            OutputStream outputStream,
             ZipOutputStream zipOutputStream
         ) {
             this.downloadId = downloadId;
@@ -2547,6 +2674,19 @@ public final class MainActivity extends Activity {
             this.fileName = fileName;
             this.mimeType = mimeType;
             this.file = file;
+        }
+    }
+
+    /**
+     * Native ZIP output destination waiting for Android's save dialog result.
+     */
+    private static final class PendingNativeZip {
+        private final String downloadId;
+        private final String fileName;
+
+        private PendingNativeZip(String downloadId, String fileName) {
+            this.downloadId = downloadId;
+            this.fileName = fileName;
         }
     }
 }

@@ -16,6 +16,7 @@
     var originalSaveAs = window.saveAs;
     var nativeStreamingDownloadActive = false;
     var activeNativeDownloads = null;
+    var pendingNativeZipDownloads = {};
 
 
     /**
@@ -757,15 +758,12 @@
         try {
             plan = buildNativeZipPlan(downloads, baseFolderName);
             updateNativeDownloadProgress(0, plan.length, 'Preparing ZIP archive');
-            window.RPlayerGatewayDownloads.beginNativeZip(downloadId);
-            window.RPlayerGatewayDownloads.setNativeZipExpectedEntries(downloadId, plan.length);
-            window.RPlayerGatewayDownloads.log('Native streaming download started for: ' + baseFolderName + ', entries=' + plan.length);
-
-            plan.forEach(function(entry) {
-                enqueueNativeZipEntry(downloadId, entry);
-            });
-
-            window.RPlayerGatewayDownloads.finishNativeZip(downloadId, baseFolderName + '.zip');
+            pendingNativeZipDownloads[downloadId] = {
+                downloads: downloads,
+                plan: plan,
+                fileName: baseFolderName + '.zip'
+            };
+            window.RPlayerGatewayDownloads.requestNativeZipDestination(downloadId, baseFolderName + '.zip');
         } catch (error) {
             nativeStreamingDownloadActive = false;
             restoreDownloadUi(downloads);
@@ -773,6 +771,43 @@
             window.RPlayerGatewayDownloads.failDownload(downloadId, 'Native streaming download failed: ' + (error && error.message ? error.message : error));
         }
     }
+
+    /**
+     * Starts queued ZIP work after Android returns a writable document URI.
+     *
+     * @param {string} downloadId Native ZIP session identifier.
+     */
+    window.RPlayerGatewayNativeZipDestinationReady = function(downloadId) {
+        var pendingDownload = pendingNativeZipDownloads[downloadId];
+
+        if (!pendingDownload) {
+            return;
+        }
+
+        delete pendingNativeZipDownloads[downloadId];
+        window.RPlayerGatewayDownloads.beginNativeZip(downloadId);
+        window.RPlayerGatewayDownloads.setNativeZipExpectedEntries(downloadId, pendingDownload.plan.length);
+        window.RPlayerGatewayDownloads.log('Native streaming download started for: ' + pendingDownload.fileName + ', entries=' + pendingDownload.plan.length);
+
+        pendingDownload.plan.forEach(function(entry) {
+            enqueueNativeZipEntry(downloadId, entry);
+        });
+
+        window.RPlayerGatewayDownloads.finishNativeZip(downloadId, pendingDownload.fileName);
+    };
+
+    /**
+     * Restores the download UI when Android's destination picker is canceled.
+     *
+     * @param {string} downloadId Native ZIP session identifier.
+     */
+    window.RPlayerGatewayNativeZipDestinationCanceled = function(downloadId) {
+        delete pendingNativeZipDownloads[downloadId];
+        nativeStreamingDownloadActive = false;
+        restoreDownloadUi(activeNativeDownloads);
+        activeNativeDownloads = null;
+        window.RPlayerGatewayDownloads.log('Native streaming download destination canceled.');
+    };
 
     window.RPlayerGatewayNativeDownloadProgress = {
         /**
