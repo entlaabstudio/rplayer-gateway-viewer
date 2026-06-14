@@ -9,6 +9,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.MediaMetadata;
@@ -77,7 +78,10 @@ public final class MainActivity extends Activity {
     private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
     private static final long VIEWER_RETRY_DELAY_MS = 5000;
+    private static final long DIRECT_RPLAYER_STARTUP_TIMEOUT_MS = 15000;
     private static final long NATIVE_ZIP_RETRY_DELAY_MS = 5000;
+    private static final String PREFERENCES_NAME = "rplayer_gateway_viewer";
+    private static final String PREF_RPLAYER_INITIALIZED_ONCE = "rplayer_initialized_once";
     private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "music_player";
     private static final String DEFAULT_MEDIA_TITLE = BuildConfig.DEFAULT_MEDIA_TITLE;
     private static final String DEFAULT_MEDIA_ARTIST = BuildConfig.DEFAULT_MEDIA_ARTIST;
@@ -126,8 +130,19 @@ public final class MainActivity extends Activity {
     private boolean playbackForegroundServiceActive;
     private boolean mainFrameLoadFailed;
     private boolean viewerRetryPending;
+    private boolean directRPlayerStartupActive;
     private Toast missingExternalAppToast;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable directRPlayerStartupFallbackRunnable = new Runnable() {
+        /**
+         * Falls back to the boot loader when direct RPlayer startup does not initialize in time.
+         */
+        @Override
+        public void run() {
+            fallbackToBootLoaderAfterDirectStartupTimeout();
+        }
+    };
+
     private final Runnable viewerRetryRunnable = new Runnable() {
         /**
          * Retries the current viewer load after a retryable startup failure.
@@ -164,7 +179,7 @@ public final class MainActivity extends Activity {
             proxyServer.start();
             localProxyAlbumRootUrl = proxyServer.albumRootUrl();
             configureWebView();
-            webView.loadUrl(proxyServer.viewerUrl());
+            loadInitialViewerUrl();
         } catch (IOException exception) {
             Log.e(LOG_TAG, "Proxy server could not be started.", exception);
             showError("RPlayer Gateway Viewer could not start the local proxy.");
@@ -355,6 +370,7 @@ public final class MainActivity extends Activity {
         settings.setSupportZoom(true);
         settings.setBuiltInZoomControls(false);
 
+        webView.addJavascriptInterface(new BootBridge(), "RPlayerGatewayBootNative");
         webView.addJavascriptInterface(new DownloadBridge(), "RPlayerGatewayDownloads");
         webView.addJavascriptInterface(new MediaSessionBridge(), "RPlayerGatewayMediaSessionNative");
         webView.addJavascriptInterface(new DisplayModeBridge(), "RPlayerGatewayDisplayModeNative");
@@ -480,6 +496,70 @@ public final class MainActivity extends Activity {
     private boolean isInternalWebViewUri(Uri uri) {
         String scheme = uri.getScheme();
         return "data".equals(scheme) || "about".equals(scheme) || "blob".equals(scheme);
+    }
+
+    /**
+     * Loads either the full boot loader or the direct RPlayer document after a previous success.
+     */
+    private void loadInitialViewerUrl() {
+        if (wasRPlayerInitializedOnce()) {
+            directRPlayerStartupActive = true;
+            mainHandler.postDelayed(directRPlayerStartupFallbackRunnable, DIRECT_RPLAYER_STARTUP_TIMEOUT_MS);
+            Log.i(LOG_TAG, "Starting RPlayer directly after previous successful initialization.");
+            webView.loadUrl(proxyServer.rplayerUrl());
+            return;
+        }
+
+        directRPlayerStartupActive = false;
+        Log.i(LOG_TAG, "Starting RPlayer through boot loader.");
+        webView.loadUrl(proxyServer.viewerUrl());
+    }
+
+    /**
+     * Checks whether RPlayer has already initialized successfully with current app data.
+     *
+     * @return true when the direct startup shortcut may be attempted
+     */
+    private boolean wasRPlayerInitializedOnce() {
+        return viewerPreferences().getBoolean(PREF_RPLAYER_INITIALIZED_ONCE, false);
+    }
+
+    /**
+     * Stores the successful RPlayer initialization shortcut flag.
+     */
+    private void markRPlayerInitializedOnce() {
+        mainHandler.removeCallbacks(directRPlayerStartupFallbackRunnable);
+        directRPlayerStartupActive = false;
+        if (!wasRPlayerInitializedOnce()) {
+            viewerPreferences().edit().putBoolean(PREF_RPLAYER_INITIALIZED_ONCE, true).apply();
+            Log.i(LOG_TAG, "Direct RPlayer startup enabled after successful initialization.");
+            return;
+        }
+
+        Log.i(LOG_TAG, "RPlayer direct startup confirmed.");
+    }
+
+    /**
+     * Falls back to the boot loader when direct startup does not reach RPlayer initialization.
+     */
+    private void fallbackToBootLoaderAfterDirectStartupTimeout() {
+        if (!directRPlayerStartupActive || webView == null || proxyServer == null) {
+            return;
+        }
+
+        directRPlayerStartupActive = false;
+        viewerPreferences().edit().remove(PREF_RPLAYER_INITIALIZED_ONCE).apply();
+        Log.w(LOG_TAG, "Direct RPlayer startup timed out. Falling back to boot loader.");
+        webView.loadUrl(proxyServer.viewerUrl());
+    }
+
+    /**
+     * Gets app-private viewer preferences cleared with Android app data.
+     *
+     * @return SharedPreferences for startup behavior
+     */
+    private SharedPreferences viewerPreferences() {
+        return getSharedPreferences(PREFERENCES_NAME, MODE_PRIVATE);
     }
 
     /**
@@ -1891,6 +1971,19 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void log(String message) {
             Log.i(LOG_TAG, "Media bridge: " + message);
+        }
+    }
+
+    /**
+     * Receives RPlayer boot lifecycle events from patched immutable JavaScript.
+     */
+    private final class BootBridge {
+        /**
+         * Marks that RPlayer reached its real initialization phase.
+         */
+        @JavascriptInterface
+        public void markRPlayerInitialized() {
+            mainHandler.post(() -> markRPlayerInitializedOnce());
         }
     }
 
