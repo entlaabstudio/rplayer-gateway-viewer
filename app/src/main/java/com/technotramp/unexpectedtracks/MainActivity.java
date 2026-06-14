@@ -2,6 +2,7 @@ package com.technotramp.unexpectedtracks;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -18,6 +19,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.util.Log;
 import android.view.View;
@@ -50,10 +52,13 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.zip.CRC32;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -67,6 +72,8 @@ import java.util.zip.ZipOutputStream;
 public final class MainActivity extends Activity {
     private static final String LOG_TAG = "RPlayerViewer";
     private static final int CREATE_DOWNLOAD_REQUEST_CODE = 1001;
+    private static final int CREATE_NATIVE_ZIP_REQUEST_CODE = 1002;
+    private static final int CREATE_NATIVE_FOLDER_REQUEST_CODE = 1003;
     private static final int MEDIA_NOTIFICATION_ID = 2001;
     private static final int COPY_BUFFER_SIZE = 32 * 1024;
     private static final long VIEWER_RETRY_DELAY_MS = 5000;
@@ -97,6 +104,8 @@ public final class MainActivity extends Activity {
     private TextView errorView;
     private DownloadSession activeDownloadSession;
     private PendingDownload pendingDownload;
+    private PendingNativeZip pendingNativeZip;
+    private PendingNativeFolder pendingNativeFolder;
     private MediaSession mediaSession;
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService nativeZipExecutor = Executors.newSingleThreadExecutor();
@@ -180,6 +189,16 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == CREATE_NATIVE_ZIP_REQUEST_CODE) {
+            handleNativeZipDestinationResult(resultCode, data);
+            return;
+        }
+
+        if (requestCode == CREATE_NATIVE_FOLDER_REQUEST_CODE) {
+            handleNativeFolderDestinationResult(resultCode, data);
+            return;
+        }
 
         if (requestCode != CREATE_DOWNLOAD_REQUEST_CODE) {
             return;
@@ -1425,6 +1444,247 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * Lets the user choose between a ZIP file and a physical folder export.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending export session
+     * @param zipFileName suggested ZIP filename
+     * @param folderName suggested album folder name
+     */
+    private void openNativeExportChoiceDialog(String downloadId, String zipFileName, String folderName) {
+        new AlertDialog.Builder(this)
+            .setTitle("Export album")
+            .setItems(new CharSequence[] {"Save ZIP file", "Save as folder"}, (dialog, which) -> {
+                if (which == 0) {
+                    openNativeZipSaveDialog(downloadId, zipFileName);
+                    return;
+                }
+
+                openNativeFolderSaveDialog(downloadId, folderName);
+            })
+            .setOnCancelListener(dialog -> notifyNativeExportDestinationCanceled(downloadId))
+            .show();
+    }
+
+    /**
+     * Opens Android's system save dialog before the native ZIP is written.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending ZIP session
+     * @param fileName suggested ZIP filename
+     */
+    private void openNativeZipSaveDialog(String downloadId, String fileName) {
+        pendingNativeZip = new PendingNativeZip(downloadId, sanitizeFileName(fileName));
+
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/zip");
+        intent.putExtra(Intent.EXTRA_TITLE, pendingNativeZip.fileName);
+
+        try {
+            startActivityForResult(intent, CREATE_NATIVE_ZIP_REQUEST_CODE);
+        } catch (ActivityNotFoundException exception) {
+            Log.e(LOG_TAG, "Android native ZIP save dialog is not available.", exception);
+            notifyNativeZipDestinationCanceled(downloadId);
+            pendingNativeZip = null;
+            showError("Android save dialog is not available.");
+        }
+    }
+
+    /**
+     * Starts native ZIP streaming after Android returns the selected output URI.
+     *
+     * @param resultCode Android activity result code
+     * @param data Android activity result data containing the selected URI
+     */
+    private void handleNativeZipDestinationResult(int resultCode, Intent data) {
+        PendingNativeZip pendingZip = pendingNativeZip;
+        pendingNativeZip = null;
+
+        if (pendingZip == null) {
+            return;
+        }
+
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            notifyNativeZipDestinationCanceled(pendingZip.downloadId);
+            return;
+        }
+
+        try {
+            OutputStream outputStream = getContentResolver().openOutputStream(data.getData());
+            if (outputStream == null) {
+                throw new IOException("Android returned no output stream for the selected native ZIP destination.");
+            }
+
+            ZipOutputStream zipOutputStream = new ZipOutputStream(outputStream);
+            // RPlayer download packages already contain compressed media assets.
+            zipOutputStream.setLevel(Deflater.NO_COMPRESSION);
+
+            synchronized (this) {
+                closeActiveDownloadSession();
+                activeDownloadSession = new DownloadSession(
+                    pendingZip.downloadId,
+                    pendingZip.fileName,
+                    "application/zip",
+                    0,
+                    null,
+                    outputStream,
+                    zipOutputStream
+                );
+            }
+
+            Log.i(LOG_TAG, "Native ZIP direct download started: " + pendingZip.fileName);
+            notifyNativeZipDestinationReady(pendingZip.downloadId);
+        } catch (IOException exception) {
+            Log.e(LOG_TAG, "Native ZIP destination could not be opened.", exception);
+            notifyNativeZipDestinationCanceled(pendingZip.downloadId);
+            showError("RPlayer Gateway Viewer could not open the selected ZIP file.");
+        }
+    }
+
+    /**
+     * Opens Android's system folder picker before the native folder export is written.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending folder session
+     * @param folderName suggested album folder name
+     */
+    private void openNativeFolderSaveDialog(String downloadId, String folderName) {
+        pendingNativeFolder = new PendingNativeFolder(downloadId, sanitizeFileName(folderName));
+
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+
+        try {
+            startActivityForResult(intent, CREATE_NATIVE_FOLDER_REQUEST_CODE);
+        } catch (ActivityNotFoundException exception) {
+            Log.e(LOG_TAG, "Android folder picker is not available.", exception);
+            notifyNativeFolderDestinationCanceled(downloadId);
+            pendingNativeFolder = null;
+            showError("Android folder picker is not available.");
+        }
+    }
+
+    /**
+     * Starts native folder export after Android returns the selected tree URI.
+     *
+     * @param resultCode Android activity result code
+     * @param data Android activity result data containing the selected tree URI
+     */
+    private void handleNativeFolderDestinationResult(int resultCode, Intent data) {
+        PendingNativeFolder pendingFolder = pendingNativeFolder;
+        pendingNativeFolder = null;
+
+        if (pendingFolder == null) {
+            return;
+        }
+
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            notifyNativeFolderDestinationCanceled(pendingFolder.downloadId);
+            return;
+        }
+
+        Uri treeUri = data.getData();
+        int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try {
+            getContentResolver().takePersistableUriPermission(treeUri, flags);
+        } catch (SecurityException exception) {
+            Log.w(LOG_TAG, "Persistent folder permission could not be kept.", exception);
+        }
+
+        try {
+            Uri rootFolderUri = DocumentsContract.buildDocumentUriUsingTree(
+                treeUri,
+                DocumentsContract.getTreeDocumentId(treeUri)
+            );
+
+            synchronized (this) {
+                closeActiveDownloadSession();
+                activeDownloadSession = new DownloadSession(
+                    pendingFolder.downloadId,
+                    pendingFolder.folderName,
+                    "application/octet-stream",
+                    0,
+                    null,
+                    null,
+                    null,
+                    rootFolderUri
+                );
+            }
+
+            Log.i(LOG_TAG, "Native folder export destination selected for: " + pendingFolder.folderName);
+            notifyNativeFolderDestinationReady(pendingFolder.downloadId);
+        } catch (IllegalArgumentException exception) {
+            Log.e(LOG_TAG, "Native folder destination could not be opened.", exception);
+            notifyNativeFolderDestinationCanceled(pendingFolder.downloadId);
+            showError("RPlayer Gateway Viewer could not open the selected folder.");
+        }
+    }
+
+    /**
+     * Notifies JavaScript that the native ZIP destination is ready for queued entries.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending ZIP session
+     */
+    private void notifyNativeZipDestinationReady(String downloadId) {
+        evaluateDownloadScript("window.RPlayerGatewayNativeZipDestinationReady && window.RPlayerGatewayNativeZipDestinationReady("
+            + JSONObject.quote(downloadId)
+            + ");");
+    }
+
+    /**
+     * Notifies JavaScript that the native ZIP destination was canceled or failed.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending ZIP session
+     */
+    private void notifyNativeZipDestinationCanceled(String downloadId) {
+        notifyNativeExportDestinationCanceled(downloadId);
+    }
+
+    /**
+     * Notifies JavaScript that the native folder destination is ready for queued entries.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending folder session
+     */
+    private void notifyNativeFolderDestinationReady(String downloadId) {
+        evaluateDownloadScript("window.RPlayerGatewayNativeFolderDestinationReady && window.RPlayerGatewayNativeFolderDestinationReady("
+            + JSONObject.quote(downloadId)
+            + ");");
+    }
+
+    /**
+     * Notifies JavaScript that the native folder destination was canceled or failed.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending folder session
+     */
+    private void notifyNativeFolderDestinationCanceled(String downloadId) {
+        notifyNativeExportDestinationCanceled(downloadId);
+    }
+
+    /**
+     * Notifies JavaScript that the native export destination was canceled or failed.
+     *
+     * @param downloadId JavaScript-generated identifier for the pending export session
+     */
+    private void notifyNativeExportDestinationCanceled(String downloadId) {
+        evaluateDownloadScript("window.RPlayerGatewayNativeExportDestinationCanceled && window.RPlayerGatewayNativeExportDestinationCanceled("
+            + JSONObject.quote(downloadId)
+            + ");");
+    }
+
+    /**
+     * Runs a small JavaScript callback in the WebView when it is still available.
+     *
+     * @param script JavaScript source to evaluate
+     */
+    private void evaluateDownloadScript(String script) {
+        if (webView == null) {
+            return;
+        }
+
+        webView.evaluateJavascript(script, null);
+    }
+
+    /**
      * Copies a temporary generated ZIP to the document URI selected by the user.
      *
      * @param download completed temporary download to copy
@@ -1639,6 +1899,18 @@ public final class MainActivity extends Activity {
      */
     private final class DownloadBridge {
         /**
+         * Opens the Android export choice before native ZIP or folder streaming starts.
+         *
+         * @param downloadId JavaScript-generated identifier for this export build
+         * @param zipFileName suggested output ZIP filename
+         * @param folderName suggested output folder name
+         */
+        @JavascriptInterface
+        public void requestNativeExportDestination(String downloadId, String zipFileName, String folderName) {
+            runOnUiThread(() -> openNativeExportChoiceDialog(downloadId, zipFileName, folderName));
+        }
+
+        /**
          * Receives diagnostic messages from the JavaScript download bridge.
          *
          * @param message diagnostic message
@@ -1684,6 +1956,11 @@ public final class MainActivity extends Activity {
          */
         @JavascriptInterface
         public synchronized void beginNativeZip(String downloadId) {
+            if (isActiveNativeZip(downloadId)) {
+                Log.i(LOG_TAG, "Native ZIP direct stream confirmed.");
+                return;
+            }
+
             closeActiveDownloadSession();
 
             try {
@@ -1718,7 +1995,7 @@ public final class MainActivity extends Activity {
          */
         @JavascriptInterface
         public synchronized void setNativeZipExpectedEntries(String downloadId, int expectedEntries) {
-            if (!isActiveNativeZip(downloadId)) {
+            if (!isActiveNativeExport(downloadId)) {
                 return;
             }
 
@@ -1762,12 +2039,12 @@ public final class MainActivity extends Activity {
             }
 
             submitNativeZipTask(downloadId, "Native ZIP source entry could not be written.", session -> {
-                File sourceFile = downloadNativeZipSourceToTempFile(session, path, sourceUrl);
+                NativeZipSourceFile sourceFile = nativeZipSourceFile(session, path, sourceUrl);
 
                 try {
-                    beginNativeZipEntryInternal(session, path);
+                    beginNativeZipStoredEntryInternal(session, path, sourceFile.file);
 
-                    try (InputStream inputStream = new FileInputStream(sourceFile)) {
+                    try (InputStream inputStream = new FileInputStream(sourceFile.file)) {
                         byte[] buffer = new byte[COPY_BUFFER_SIZE];
                         int read;
                         while ((read = inputStream.read(buffer)) >= 0) {
@@ -1780,7 +2057,9 @@ public final class MainActivity extends Activity {
                     markNativeZipEntryFinished(session, path);
                     Log.i(LOG_TAG, "Native ZIP source entry finished: " + path + " <- " + sourceUrl);
                 } finally {
-                    deleteTempFile(sourceFile);
+                    if (sourceFile.temporary) {
+                        deleteTempFile(sourceFile.file);
+                    }
                 }
             });
         }
@@ -1855,6 +2134,155 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Starts a native folder export assembled from individual RPlayer entries.
+         *
+         * @param downloadId JavaScript-generated identifier for this folder export
+         */
+        @JavascriptInterface
+        public synchronized void beginNativeFolder(String downloadId) {
+            if (isActiveNativeFolder(downloadId)) {
+                Log.i(LOG_TAG, "Native folder export confirmed.");
+            }
+        }
+
+        /**
+         * Adds a UTF-8 text file to the active native folder export.
+         *
+         * @param downloadId JavaScript-generated identifier for this folder export
+         * @param path relative file path requested by RPlayer
+         * @param text UTF-8 text content
+         */
+        @JavascriptInterface
+        public void addNativeFolderTextEntry(String downloadId, String path, String text) {
+            submitNativeFolderTask(downloadId, "Native folder text file could not be written.", session -> {
+                byte[] data = (text == null ? "" : text).getBytes(StandardCharsets.UTF_8);
+                writeNativeFolderBytes(session, path, data);
+                markNativeZipEntryFinished(session, path);
+            });
+        }
+
+        /**
+         * Writes a local proxy resource to the active native folder export.
+         *
+         * @param downloadId JavaScript-generated identifier for this folder export
+         * @param path relative file path requested by RPlayer
+         * @param sourceUrl local proxy source URL to copy from
+         */
+        @JavascriptInterface
+        public void addNativeFolderSourceEntry(String downloadId, String path, String sourceUrl) {
+            if (!isLocalProxyAlbumUrl(sourceUrl)) {
+                Log.w(LOG_TAG, "Blocked native folder source outside album proxy: " + sourceUrl);
+                failDownload(downloadId, "Native folder source is outside the album proxy.");
+                return;
+            }
+
+            submitNativeFolderTask(downloadId, "Native folder source file could not be written.", session -> {
+                NativeZipSourceFile sourceFile = nativeZipSourceFile(session, path, sourceUrl);
+
+                try {
+                    writeNativeFolderFile(session, path, sourceFile.file);
+                    markNativeZipEntryFinished(session, path);
+                    Log.i(LOG_TAG, "Native folder source file finished: " + path + " <- " + sourceUrl);
+                } finally {
+                    if (sourceFile.temporary) {
+                        deleteTempFile(sourceFile.file);
+                    }
+                }
+            });
+        }
+
+        /**
+         * Writes an MP3 file with RPlayer ID3 metadata to the active native folder export.
+         *
+         * @param downloadId JavaScript-generated identifier for this folder export
+         * @param path relative file path requested by RPlayer
+         * @param sourceUrl local proxy MP3 source URL to copy from
+         * @param metadataJson JSON-encoded track metadata and optional image URLs
+         */
+        @JavascriptInterface
+        public void addNativeFolderTaggedMp3Entry(String downloadId, String path, String sourceUrl, String metadataJson) {
+            if (!isLocalProxyAlbumUrl(sourceUrl)) {
+                Log.w(LOG_TAG, "Blocked native folder MP3 source outside album proxy: " + sourceUrl);
+                failDownload(downloadId, "Native folder MP3 source is outside the album proxy.");
+                return;
+            }
+
+            JSONObject metadata;
+            try {
+                metadata = new JSONObject(metadataJson == null ? "{}" : metadataJson);
+            } catch (JSONException exception) {
+                Log.e(LOG_TAG, "Native folder MP3 metadata could not be parsed.", exception);
+                failDownload(downloadId, "Native folder MP3 metadata could not be parsed.");
+                return;
+            }
+
+            String coverImageUrl = metadata.optString("coverImageUrl", "");
+            String iconImageUrl = metadata.optString("iconImageUrl", "");
+            if (!isBlank(coverImageUrl) && !isLocalProxyAlbumUrl(coverImageUrl)) {
+                Log.w(LOG_TAG, "Blocked native folder MP3 cover outside album proxy: " + coverImageUrl);
+                failDownload(downloadId, "Native folder MP3 cover is outside the album proxy.");
+                return;
+            }
+
+            if (!isBlank(iconImageUrl) && !isLocalProxyAlbumUrl(iconImageUrl)) {
+                Log.w(LOG_TAG, "Blocked native folder MP3 icon outside album proxy: " + iconImageUrl);
+                failDownload(downloadId, "Native folder MP3 icon is outside the album proxy.");
+                return;
+            }
+
+            submitNativeFolderTask(downloadId, "Native folder tagged MP3 file could not be written.", session -> {
+                File sourceFile = downloadNativeZipSourceToTempFile(session, path, sourceUrl);
+
+                try {
+                    byte[] coverImage = readOptionalNativeZipBytes(session, coverImageUrl, "metadata cover image");
+                    byte[] iconImage = readOptionalNativeZipBytes(session, iconImageUrl, "metadata icon image");
+                    byte[] id3Tag = Id3TagWriter.buildTag(metadata, coverImage, iconImage);
+
+                    try (OutputStream outputStream = openNativeFolderOutputStream(session, path)) {
+                        outputStream.write(id3Tag);
+                        session.receivedBytes += id3Tag.length;
+
+                        try (InputStream inputStream = new FileInputStream(sourceFile)) {
+                            byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                            session.receivedBytes += Id3TagWriter.copyMp3WithoutExistingTag(
+                                inputStream,
+                                outputStream,
+                                buffer
+                            );
+                        }
+                    }
+
+                    markNativeZipEntryFinished(session, path);
+                    Log.i(LOG_TAG, "Native folder tagged MP3 file finished: " + path + " <- " + sourceUrl);
+                } finally {
+                    deleteTempFile(sourceFile);
+                }
+            });
+        }
+
+        /**
+         * Finalizes the native folder export.
+         *
+         * @param downloadId JavaScript-generated identifier for this folder export
+         * @param folderName suggested folder name from RPlayer
+         */
+        @JavascriptInterface
+        public void finishNativeFolder(String downloadId, String folderName) {
+            submitNativeFolderTask(downloadId, "Native folder export could not be finalized.", session -> {
+                synchronized (DownloadBridge.this) {
+                    if (activeDownloadSession == session) {
+                        activeDownloadSession = null;
+                    }
+                }
+
+                Log.i(LOG_TAG, "Native folder export finished: " + sanitizeFileName(folderName)
+                    + ", entries=" + session.zipEntryCount
+                    + ", bytes=" + session.receivedBytes);
+                reportNativeZipProgress(session, "");
+            });
+        }
+
+        /**
          * Starts a binary file entry in the active native ZIP.
          *
          * @param downloadId JavaScript-generated identifier for this ZIP build
@@ -1916,7 +2344,7 @@ public final class MainActivity extends Activity {
         }
 
         /**
-         * Finalizes the native ZIP file and opens Android's save dialog.
+         * Finalizes the native ZIP file written to the selected Android document.
          *
          * @param downloadId JavaScript-generated identifier for this ZIP build
          * @param fileName suggested filename from RPlayer
@@ -1937,16 +2365,10 @@ public final class MainActivity extends Activity {
                     }
                 }
 
-                PendingDownload download = new PendingDownload(
-                    sanitizeFileName(fileName),
-                    session.mimeType,
-                    session.file
-                );
-                Log.i(LOG_TAG, "Native ZIP download finished: " + download.fileName
+                Log.i(LOG_TAG, "Native ZIP download finished: " + sanitizeFileName(fileName)
                     + ", entries=" + session.zipEntryCount
                     + ", bytes=" + session.receivedBytes);
                 reportNativeZipProgress(session, "");
-                runOnUiThread(() -> openSaveDialog(download));
             });
         }
 
@@ -2020,7 +2442,7 @@ public final class MainActivity extends Activity {
             }
 
             Log.e(LOG_TAG, message == null ? "Generated ZIP download failed." : message);
-            if (activeDownloadSession.zipOutputStream != null) {
+            if (activeDownloadSession.zipOutputStream != null || activeDownloadSession.folderRootUri != null) {
                 dispatchNativeZipProgress(
                     -1,
                     activeDownloadSession.expectedZipEntries,
@@ -2052,6 +2474,26 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Checks whether a JavaScript callback belongs to the current native folder session.
+         *
+         * @param downloadId JavaScript-generated identifier to validate
+         * @return true when the callback belongs to an active native folder session
+         */
+        private boolean isActiveNativeFolder(String downloadId) {
+            return isActiveDownload(downloadId) && activeDownloadSession.folderRootUri != null;
+        }
+
+        /**
+         * Checks whether a JavaScript callback belongs to any active native export session.
+         *
+         * @param downloadId JavaScript-generated identifier to validate
+         * @return true when the callback belongs to a native ZIP or folder export
+         */
+        private boolean isActiveNativeExport(String downloadId) {
+            return isActiveNativeZip(downloadId) || isActiveNativeFolder(downloadId);
+        }
+
+        /**
          * Gets the active native ZIP session for a queued bridge call.
          *
          * @param downloadId JavaScript-generated identifier to validate
@@ -2066,6 +2508,20 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Gets the active native folder session for a queued bridge call.
+         *
+         * @param downloadId JavaScript-generated identifier to validate
+         * @return active native folder session or null when the callback is stale
+         */
+        private synchronized DownloadSession activeNativeFolderSession(String downloadId) {
+            if (!isActiveNativeFolder(downloadId)) {
+                return null;
+            }
+
+            return activeDownloadSession;
+        }
+
+        /**
          * Queues one native ZIP write task outside the WebView JavaScript bridge thread.
          *
          * @param downloadId JavaScript-generated identifier for this ZIP build
@@ -2073,7 +2529,29 @@ public final class MainActivity extends Activity {
          * @param task ZIP write task using the active download session
          */
         private void submitNativeZipTask(String downloadId, String failureMessage, NativeZipTask task) {
-            DownloadSession session = activeNativeZipSession(downloadId);
+            submitNativeExportTask(downloadId, failureMessage, activeNativeZipSession(downloadId), task);
+        }
+
+        /**
+         * Queues one native folder write task outside the WebView JavaScript bridge thread.
+         *
+         * @param downloadId JavaScript-generated identifier for this folder export
+         * @param failureMessage message used when the task fails
+         * @param task folder write task using the active download session
+         */
+        private void submitNativeFolderTask(String downloadId, String failureMessage, NativeZipTask task) {
+            submitNativeExportTask(downloadId, failureMessage, activeNativeFolderSession(downloadId), task);
+        }
+
+        /**
+         * Queues one native export task outside the WebView JavaScript bridge thread.
+         *
+         * @param downloadId JavaScript-generated identifier for this export
+         * @param failureMessage message used when the task fails
+         * @param session active export session
+         * @param task write task using the active download session
+         */
+        private void submitNativeExportTask(String downloadId, String failureMessage, DownloadSession session, NativeZipTask task) {
             if (session == null) {
                 return;
             }
@@ -2138,6 +2616,52 @@ public final class MainActivity extends Activity {
         }
 
         /**
+         * Opens a stored ZIP entry for an already materialized binary source file.
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path requested by RPlayer
+         * @param sourceFile complete source file that will be copied into the entry
+         * @throws IOException when the ZIP stream rejects the entry or the source cannot be read
+         */
+        private void beginNativeZipStoredEntryInternal(DownloadSession session, String path, File sourceFile) throws IOException {
+            if (session.currentZipEntry != null) {
+                throw new IOException("Previous native ZIP entry is still open.");
+            }
+
+            String cleanPath = sanitizeZipEntryPath(path);
+            ZipEntry zipEntry = new ZipEntry(cleanPath);
+            long size = sourceFile.length();
+            zipEntry.setMethod(ZipEntry.STORED);
+            zipEntry.setSize(size);
+            zipEntry.setCompressedSize(size);
+            zipEntry.setCrc(crc32(sourceFile));
+            session.zipOutputStream.putNextEntry(zipEntry);
+            session.currentZipEntry = cleanPath;
+            session.zipEntryCount += 1;
+            Log.i(LOG_TAG, "Native ZIP stored entry started: " + cleanPath + ", bytes=" + size);
+        }
+
+        /**
+         * Calculates CRC-32 required by the ZIP stored entry format.
+         *
+         * @param file complete source file to describe in the ZIP central directory
+         * @return unsigned CRC-32 value expected by ZipEntry
+         * @throws IOException when the source file cannot be read
+         */
+        private long crc32(File file) throws IOException {
+            CRC32 crc32 = new CRC32();
+            try (InputStream inputStream = new FileInputStream(file)) {
+                byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                int read;
+                while ((read = inputStream.read(buffer)) >= 0) {
+                    crc32.update(buffer, 0, read);
+                }
+            }
+
+            return crc32.getValue();
+        }
+
+        /**
          * Closes the currently open file entry in the active native ZIP.
          *
          * @throws IOException when the ZIP stream cannot close the entry
@@ -2184,6 +2708,139 @@ public final class MainActivity extends Activity {
                 session.expectedZipEntries,
                 currentEntry == null ? "" : currentEntry
             );
+        }
+
+        /**
+         * Writes one byte array into the active native folder export.
+         *
+         * @param session active native folder session
+         * @param path relative file path requested by RPlayer
+         * @param data file bytes to write
+         * @throws IOException when Android refuses the destination file
+         */
+        private void writeNativeFolderBytes(DownloadSession session, String path, byte[] data) throws IOException {
+            try (OutputStream outputStream = openNativeFolderOutputStream(session, path)) {
+                outputStream.write(data);
+                session.receivedBytes += data.length;
+            }
+        }
+
+        /**
+         * Copies one complete file into the active native folder export.
+         *
+         * @param session active native folder session
+         * @param path relative file path requested by RPlayer
+         * @param sourceFile complete source file to copy
+         * @throws IOException when Android refuses the destination file
+         */
+        private void writeNativeFolderFile(DownloadSession session, String path, File sourceFile) throws IOException {
+            try (
+                InputStream inputStream = new FileInputStream(sourceFile);
+                OutputStream outputStream = openNativeFolderOutputStream(session, path)
+            ) {
+                byte[] buffer = new byte[COPY_BUFFER_SIZE];
+                int read;
+                while ((read = inputStream.read(buffer)) >= 0) {
+                    outputStream.write(buffer, 0, read);
+                    session.receivedBytes += read;
+                }
+            }
+        }
+
+        /**
+         * Opens one output file in the selected native folder export tree.
+         *
+         * @param session active native folder session
+         * @param path relative file path requested by RPlayer
+         * @return writable stream to the selected Android document
+         * @throws IOException when the file or parent folders cannot be created
+         */
+        private OutputStream openNativeFolderOutputStream(DownloadSession session, String path) throws IOException {
+            String relativePath = relativeNativeFolderPath(session, path);
+            int lastSlash = relativePath.lastIndexOf('/');
+            String directoryPath = lastSlash < 0 ? "" : relativePath.substring(0, lastSlash);
+            String fileName = lastSlash < 0 ? relativePath : relativePath.substring(lastSlash + 1);
+            if (fileName.trim().isEmpty()) {
+                throw new IOException("Native folder file path is empty.");
+            }
+
+            Uri parentUri = nativeFolderDirectoryUri(session, directoryPath);
+            Uri fileUri = DocumentsContract.createDocument(
+                getContentResolver(),
+                parentUri,
+                MimeTypes.fromPath(fileName, null),
+                fileName
+            );
+            if (fileUri == null) {
+                throw new IOException("Android returned no file URI for: " + relativePath);
+            }
+
+            OutputStream outputStream = getContentResolver().openOutputStream(fileUri);
+            if (outputStream == null) {
+                throw new IOException("Android returned no output stream for: " + relativePath);
+            }
+
+            return outputStream;
+        }
+
+        /**
+         * Resolves or creates one folder path in the selected native export tree.
+         *
+         * @param session active native folder session
+         * @param directoryPath relative directory path inside the album folder
+         * @return Android document URI for the resolved directory
+         * @throws IOException when Android refuses to create a directory
+         */
+        private Uri nativeFolderDirectoryUri(DownloadSession session, String directoryPath) throws IOException {
+            Uri cachedUri = session.folderUris.get(directoryPath);
+            if (cachedUri != null) {
+                return cachedUri;
+            }
+
+            Uri parentUri = session.folderRootUri;
+            StringBuilder currentPath = new StringBuilder();
+            for (String part : directoryPath.split("/")) {
+                if (part.isEmpty()) {
+                    continue;
+                }
+
+                if (currentPath.length() > 0) {
+                    currentPath.append('/');
+                }
+                currentPath.append(part);
+                String key = currentPath.toString();
+                Uri existingUri = session.folderUris.get(key);
+                if (existingUri != null) {
+                    parentUri = existingUri;
+                    continue;
+                }
+
+                Uri createdUri = DocumentsContract.createDocument(
+                    getContentResolver(),
+                    parentUri,
+                    DocumentsContract.Document.MIME_TYPE_DIR,
+                    part
+                );
+                if (createdUri == null) {
+                    throw new IOException("Android returned no directory URI for: " + key);
+                }
+
+                session.folderUris.put(key, createdUri);
+                parentUri = createdUri;
+            }
+
+            return parentUri;
+        }
+
+        /**
+         * Keeps the ZIP-style export path unchanged inside the selected parent folder.
+         *
+         * @param session active native folder session
+         * @param path path produced by the RPlayer export plan
+         * @return path relative to the selected parent folder
+         */
+        private String relativeNativeFolderPath(DownloadSession session, String path) {
+            return sanitizeZipEntryPath(path);
         }
 
         /**
@@ -2282,6 +2939,25 @@ public final class MainActivity extends Activity {
                     }
                 }
             }
+        }
+
+        /**
+         * Finds a verified persistent source file before falling back to a temporary download.
+         *
+         * @param session active native ZIP session
+         * @param path ZIP entry path or diagnostic label
+         * @param sourceUrl local proxy source URL
+         * @return source file and whether it should be deleted after the ZIP entry is written
+         * @throws IOException when the source cannot be downloaded or the session ends
+         */
+        private NativeZipSourceFile nativeZipSourceFile(DownloadSession session, String path, String sourceUrl) throws IOException {
+            File cachedFile = proxyServer == null ? null : proxyServer.cachedFileForLocalUrl(sourceUrl);
+            if (cachedFile != null) {
+                Log.i(LOG_TAG, "Native ZIP source uses persistent cache: " + path + " <- " + sourceUrl);
+                return new NativeZipSourceFile(cachedFile, false);
+            }
+
+            return new NativeZipSourceFile(downloadNativeZipSourceToTempFile(session, path, sourceUrl), true);
         }
 
         /**
@@ -2401,6 +3077,25 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * Describes one native ZIP source file and its ownership.
+     */
+    private final class NativeZipSourceFile {
+        private final File file;
+        private final boolean temporary;
+
+        /**
+         * Creates a source file descriptor for native ZIP writing.
+         *
+         * @param file complete file to copy into the ZIP entry
+         * @param temporary true when the file must be deleted after use
+         */
+        private NativeZipSourceFile(File file, boolean temporary) {
+            this.file = file;
+            this.temporary = temporary;
+        }
+    }
+
+    /**
      * Mutable state for one in-progress Blob transfer from JavaScript to Android.
      */
     private static final class DownloadSession {
@@ -2409,8 +3104,10 @@ public final class MainActivity extends Activity {
         private final String mimeType;
         private final long totalBytes;
         private final File file;
-        private final FileOutputStream outputStream;
+        private final OutputStream outputStream;
         private final ZipOutputStream zipOutputStream;
+        private final Uri folderRootUri;
+        private final Map<String, Uri> folderUris = new HashMap<>();
         private int nextChunkIndex;
         private long receivedBytes;
         private int zipEntryCount;
@@ -2424,7 +3121,7 @@ public final class MainActivity extends Activity {
             String mimeType,
             long totalBytes,
             File file,
-            FileOutputStream outputStream
+            OutputStream outputStream
         ) {
             this(downloadId, fileName, mimeType, totalBytes, file, outputStream, null);
         }
@@ -2435,8 +3132,21 @@ public final class MainActivity extends Activity {
             String mimeType,
             long totalBytes,
             File file,
-            FileOutputStream outputStream,
+            OutputStream outputStream,
             ZipOutputStream zipOutputStream
+        ) {
+            this(downloadId, fileName, mimeType, totalBytes, file, outputStream, zipOutputStream, null);
+        }
+
+        private DownloadSession(
+            String downloadId,
+            String fileName,
+            String mimeType,
+            long totalBytes,
+            File file,
+            OutputStream outputStream,
+            ZipOutputStream zipOutputStream,
+            Uri folderRootUri
         ) {
             this.downloadId = downloadId;
             this.fileName = fileName;
@@ -2445,6 +3155,10 @@ public final class MainActivity extends Activity {
             this.file = file;
             this.outputStream = outputStream;
             this.zipOutputStream = zipOutputStream;
+            this.folderRootUri = folderRootUri;
+            if (folderRootUri != null) {
+                this.folderUris.put("", folderRootUri);
+            }
         }
     }
 
@@ -2460,6 +3174,32 @@ public final class MainActivity extends Activity {
             this.fileName = fileName;
             this.mimeType = mimeType;
             this.file = file;
+        }
+    }
+
+    /**
+     * Native ZIP output destination waiting for Android's save dialog result.
+     */
+    private static final class PendingNativeZip {
+        private final String downloadId;
+        private final String fileName;
+
+        private PendingNativeZip(String downloadId, String fileName) {
+            this.downloadId = downloadId;
+            this.fileName = fileName;
+        }
+    }
+
+    /**
+     * Native folder output destination waiting for Android's folder picker result.
+     */
+    private static final class PendingNativeFolder {
+        private final String downloadId;
+        private final String folderName;
+
+        private PendingNativeFolder(String downloadId, String folderName) {
+            this.downloadId = downloadId;
+            this.folderName = folderName;
         }
     }
 }
