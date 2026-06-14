@@ -801,7 +801,7 @@ final class GatewayProxyServer implements Closeable {
             return;
         }
 
-        metadata.save(cacheEntry.metaFile);
+        metadata.asVerified().save(cacheEntry.metaFile);
         Log.i(
             LOG_TAG,
             "Persistent cache stored: "
@@ -842,16 +842,45 @@ final class GatewayProxyServer implements Closeable {
      * @return true when the cached response can be served without refetching
      */
     private boolean isCacheEntryValid(CacheEntry cacheEntry, CacheMetadata metadata) {
+        if (metadata.verified) {
+            return isVerifiedCacheEntryUsable(cacheEntry.dataFile, metadata);
+        }
+
         if (!isCacheCandidateValid(cacheEntry.dataFile, metadata)) {
             return false;
         }
 
         try {
-            return metadata.sha256.equals(sha256(cacheEntry.dataFile));
+            boolean valid = metadata.sha256.equals(sha256(cacheEntry.dataFile));
+            if (valid) {
+                metadata.asVerified().save(cacheEntry.metaFile);
+                Log.i(LOG_TAG, "Persistent cache verified: " + cacheEntry.dataFile.getName());
+            }
+
+            return valid;
         } catch (IOException exception) {
             Log.w(LOG_TAG, "Persistent cache SHA-256 check failed: " + cacheEntry.dataFile.getName(), exception);
             return false;
         }
+    }
+
+    /**
+     * Checks fast metadata invariants for an already verified cache entry.
+     *
+     * @param dataFile cached body file
+     * @param metadata metadata loaded from disk
+     * @return true when the cached response can be trusted without hashing again
+     */
+    private boolean isVerifiedCacheEntryUsable(File dataFile, CacheMetadata metadata) {
+        if (!dataFile.isFile() || metadata.actualContentLength != dataFile.length()) {
+            return false;
+        }
+
+        if (metadata.expectedContentLength >= 0 && metadata.expectedContentLength != dataFile.length()) {
+            return false;
+        }
+
+        return !metadata.sha256.isEmpty() && hasUsableIpfsIdentity(metadata);
     }
 
     /**
@@ -1585,6 +1614,7 @@ final class GatewayProxyServer implements Closeable {
         private final long expectedContentLength;
         private final long actualContentLength;
         private final String sha256;
+        private final boolean verified;
 
         /**
          * Creates immutable cache response metadata.
@@ -1595,15 +1625,17 @@ final class GatewayProxyServer implements Closeable {
          * @param sha256 local SHA-256 of cached body bytes
          */
         private CacheMetadata(String contentType, CacheResponseHeaders cacheHeaders, long actualContentLength, String sha256) {
-            String safeContentType = safeHeaderValue(contentType);
-            this.contentType = safeContentType.isEmpty() ? "application/octet-stream" : safeContentType;
-            this.lastModified = cacheHeaders.lastModified;
-            this.etag = cacheHeaders.etag;
-            this.ipfsPath = cacheHeaders.ipfsPath;
-            this.ipfsRoots = cacheHeaders.ipfsRoots;
-            this.expectedContentLength = cacheHeaders.expectedContentLength;
-            this.actualContentLength = actualContentLength;
-            this.sha256 = safeHeaderValue(sha256);
+            this(
+                contentType,
+                cacheHeaders.lastModified,
+                cacheHeaders.etag,
+                cacheHeaders.ipfsPath,
+                cacheHeaders.ipfsRoots,
+                cacheHeaders.expectedContentLength,
+                actualContentLength,
+                sha256,
+                false
+            );
         }
 
         /**
@@ -1617,7 +1649,8 @@ final class GatewayProxyServer implements Closeable {
             String ipfsRoots,
             long expectedContentLength,
             long actualContentLength,
-            String sha256
+            String sha256,
+            boolean verified
         ) {
             String safeContentType = safeHeaderValue(contentType);
             this.contentType = safeContentType.isEmpty() ? "application/octet-stream" : safeContentType;
@@ -1628,6 +1661,30 @@ final class GatewayProxyServer implements Closeable {
             this.expectedContentLength = expectedContentLength;
             this.actualContentLength = actualContentLength;
             this.sha256 = safeHeaderValue(sha256);
+            this.verified = verified;
+        }
+
+        /**
+         * Creates a copy that can skip expensive validation on future cache hits.
+         *
+         * @return metadata marked as already verified
+         */
+        private CacheMetadata asVerified() {
+            if (verified) {
+                return this;
+            }
+
+            return new CacheMetadata(
+                contentType,
+                lastModified,
+                etag,
+                ipfsPath,
+                ipfsRoots,
+                expectedContentLength,
+                actualContentLength,
+                sha256,
+                true
+            );
         }
 
         /**
@@ -1643,7 +1700,7 @@ final class GatewayProxyServer implements Closeable {
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
                 String version = reader.readLine();
-                if (!"cache-v2".equals(version)) {
+                if (!"cache-v2".equals(version) && !"cache-v3".equals(version)) {
                     return null;
                 }
 
@@ -1655,6 +1712,7 @@ final class GatewayProxyServer implements Closeable {
                 long expectedContentLength = Long.parseLong(reader.readLine());
                 long actualContentLength = Long.parseLong(reader.readLine());
                 String sha256 = reader.readLine();
+                boolean verified = "cache-v3".equals(version) && Boolean.parseBoolean(reader.readLine());
                 return new CacheMetadata(
                     contentType,
                     lastModified,
@@ -1663,7 +1721,8 @@ final class GatewayProxyServer implements Closeable {
                     ipfsRoots,
                     expectedContentLength,
                     actualContentLength,
-                    sha256
+                    sha256,
+                    verified
                 );
             } catch (IOException | RuntimeException exception) {
                 return null;
@@ -1678,7 +1737,7 @@ final class GatewayProxyServer implements Closeable {
          */
         private void save(File file) throws IOException {
             try (FileOutputStream outputStream = new FileOutputStream(file)) {
-                String text = "cache-v2\n"
+                String text = "cache-v3\n"
                     + contentType + "\n"
                     + lastModified + "\n"
                     + etag + "\n"
@@ -1686,7 +1745,8 @@ final class GatewayProxyServer implements Closeable {
                     + ipfsRoots + "\n"
                     + expectedContentLength + "\n"
                     + actualContentLength + "\n"
-                    + sha256 + "\n";
+                    + sha256 + "\n"
+                    + verified + "\n";
                 outputStream.write(text.getBytes(StandardCharsets.UTF_8));
             }
         }
