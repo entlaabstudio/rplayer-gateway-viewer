@@ -14,8 +14,8 @@ android {
         applicationId "com.technotramp.unexpectedtracks"
         minSdk 23
         targetSdk 35
-        versionCode 37
-        versionName "0.1.5"
+        versionCode 49
+        versionName "0.6.1"
     }
 
     flavorDimensions "album"
@@ -29,6 +29,7 @@ android {
             buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"Technotramp\""
             buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Unexpected Tracks\""
             buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"unexpected-tracks.zip\""
+            buildConfigField "String", "RPLAYER_INDEX_FILE", "\"rplayer.htm\""
         }
 
         dreamer {
@@ -39,6 +40,7 @@ android {
             buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"Michal Diviš\""
             buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Dreamer\""
             buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"dreamer.zip\""
+            buildConfigField "String", "RPLAYER_INDEX_FILE", "\"rplayer.htm\""
         }
 
         krehkyMechanismus {
@@ -49,6 +51,7 @@ android {
             buildConfigField "String", "DEFAULT_MEDIA_ARTIST", "\"První hoře\""
             buildConfigField "String", "DEFAULT_MEDIA_ALBUM", "\"Křehký mechanismus pozemského štěstí\""
             buildConfigField "String", "DEFAULT_DOWNLOAD_FILE_NAME", "\"krehky-mechanismus.zip\""
+            buildConfigField "String", "RPLAYER_INDEX_FILE", "\"rplayer.htm\""
         }
     }
 

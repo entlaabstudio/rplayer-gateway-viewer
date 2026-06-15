@@ -153,6 +153,7 @@
         }
 
         state.lastMediaElement = mediaElement;
+        installPersistentAudioCacheIndicator(mediaElement.ownerDocument.defaultView || rootWindow, mediaElement);
 
         if (mediaElement.RPlayerGatewayViewerMediaElementHook) {
             return;
@@ -224,6 +225,25 @@
         return null;
     }
 
+
+    /**
+     * Finds RPlayer's detached audio object in a target window.
+     *
+     * @param {Window} targetWindow Window object to inspect.
+     * @return {HTMLMediaElement|null} RPlayer audio object or null when unavailable.
+     */
+    function findRPlayerAudioObject(targetWindow) {
+        try {
+            if (targetWindow.RPObj && isUsableMediaElement(targetWindow.RPObj.audioObject)) {
+                return targetWindow.RPObj.audioObject;
+            }
+        } catch (error) {
+            debugLog('Could not inspect RPlayer audio object: ' + error.message);
+        }
+
+        return null;
+    }
+
     /**
      * Formats buffered media ranges for diagnostics.
      *
@@ -267,6 +287,139 @@
                 + ', error=' + errorCode
                 + ', source=' + source
         );
+    }
+
+
+    /**
+     * Resolves the current media source to a local proxy path.
+     *
+     * @param {Window} targetWindow Window containing the media element.
+     * @param {HTMLMediaElement} mediaElement Media element used by RPlayer.
+     * @return {string} Local IPFS request path, or an empty string when unavailable.
+     */
+    function currentAudioCachePath(targetWindow, mediaElement) {
+        var sourceUrl = mediaElement.currentSrc || mediaElement.src || '';
+
+        if (!sourceUrl) {
+            debugLog('Persistent audio cache: audio source unavailable');
+            return '';
+        }
+
+        try {
+            return new URL(sourceUrl, targetWindow.document.baseURI).pathname;
+        } catch (error) {
+            debugLog('Persistent audio cache: audio source URL parse failed: ' + error.message);
+            return '';
+        }
+    }
+
+    /**
+     * Installs a narrow jQuery output hook for the RPlayer buffer percentage span.
+     *
+     * @param {Window} targetWindow Window containing RPlayer UI.
+     */
+    function installPersistentBufferHtmlHook(targetWindow) {
+        var originalHtml;
+
+        if (targetWindow.RPlayerGatewayPersistentBufferHtmlHookInstalled || !targetWindow.jQuery) {
+            return;
+        }
+
+        originalHtml = targetWindow.jQuery.fn.html;
+        targetWindow.jQuery.fn.html = function(value) {
+            if (arguments.length > 0
+                && targetWindow.RPlayerGatewayPersistentAudioCacheComplete
+                && (this.is('.rplayerBufferCondition') || this.filter('.rplayerBufferCondition').length > 0)
+            ) {
+                return originalHtml.call(this, '100');
+            }
+
+            return originalHtml.apply(this, arguments);
+        };
+
+        targetWindow.RPlayerGatewayPersistentBufferHtmlHookInstalled = true;
+        debugLog('Persistent audio cache: buffer HTML hook installed.');
+    }
+
+    /**
+     * Applies the complete persistent audio cache state to the visible buffer indicator.
+     *
+     * @param {Window} targetWindow Window containing RPlayer UI.
+     */
+    function applyPersistentAudioCacheComplete(targetWindow) {
+        targetWindow.RPlayerGatewayPersistentAudioCacheComplete = true;
+        installPersistentBufferHtmlHook(targetWindow);
+
+        if (targetWindow.jQuery) {
+            targetWindow.jQuery('.rplayerBufferCondition').html('100');
+        }
+
+        debugLog('Persistent audio cache: visible buffer indicator set to 100%.');
+    }
+
+    /**
+     * Asks the local proxy whether the current album audio file is fully cached.
+     *
+     * @param {Window} targetWindow Window containing RPlayer UI.
+     * @param {HTMLMediaElement} mediaElement Media element used by RPlayer.
+     */
+    function refreshPersistentAudioCacheState(targetWindow, mediaElement) {
+        var audioPath;
+        var stateUrl;
+
+        if (targetWindow.RPlayerGatewayPersistentAudioCacheComplete) {
+            return;
+        }
+
+        if (typeof targetWindow.fetch !== 'function') {
+            debugLog('Persistent audio cache: fetch unavailable');
+            return;
+        }
+
+        audioPath = currentAudioCachePath(targetWindow, mediaElement);
+        if (!audioPath) {
+            return;
+        }
+
+        stateUrl = '/__rplayer_gateway/cache-state?path=' + encodeURIComponent(audioPath);
+        debugLog('Persistent audio cache: checking ' + audioPath);
+        targetWindow.fetch(stateUrl, {
+            cache: 'no-store'
+        }).then(function(response) {
+            return response.ok ? response.json() : null;
+        }).then(function(cacheState) {
+            debugLog('Persistent audio cache: state=' + (cacheState ? JSON.stringify(cacheState) : 'null'));
+            if (cacheState && cacheState.complete === true) {
+                applyPersistentAudioCacheComplete(targetWindow);
+            }
+        }).catch(function(error) {
+            debugLog('Persistent audio cache: state request failed: ' + (error && error.message ? error.message : error));
+        });
+    }
+
+    /**
+     * Hooks media lifecycle events that naturally indicate a useful cache-state refresh point.
+     *
+     * @param {Window} targetWindow Window containing RPlayer UI.
+     * @param {HTMLMediaElement} mediaElement Media element used by RPlayer.
+     */
+    function installPersistentAudioCacheIndicator(targetWindow, mediaElement) {
+        installPersistentBufferHtmlHook(targetWindow);
+        refreshPersistentAudioCacheState(targetWindow, mediaElement);
+
+        if (mediaElement.RPlayerGatewayPersistentCacheIndicatorHook) {
+            return;
+        }
+
+        debugLog('Persistent audio cache: audio event hook installed.');
+
+        ['loadedmetadata', 'canplay', 'progress', 'playing', 'pause', 'ended'].forEach(function(eventName) {
+            mediaElement.addEventListener(eventName, function() {
+                refreshPersistentAudioCacheState(targetWindow, mediaElement);
+            });
+        });
+
+        mediaElement.RPlayerGatewayPersistentCacheIndicatorHook = true;
     }
 
     /**
@@ -634,6 +787,11 @@
 
                 if (browserPlaybackState && browserPlaybackState !== 'none') {
                     sendBrowserPlaybackStateToAndroid(browserPlaybackState);
+                }
+
+                var rplayerAudioObject = findRPlayerAudioObject(targetWindow);
+                if (rplayerAudioObject) {
+                    rememberMediaElement(rplayerAudioObject);
                 }
 
                 sendProgressToAndroid(targetWindow);

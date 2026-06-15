@@ -15,11 +15,13 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -45,6 +47,10 @@ final class GatewayProxyServer implements Closeable {
     private static final String ENTRY_FILE = "index.htm";
     private static final String IPFS_ROOT_PATH = "/ipfs/" + IPFS_CID + "/";
     private static final String ROOT_PATH = IPFS_ROOT_PATH + ENTRY_FILE;
+    private static final String RPLAYER_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.js";
+    private static final String RPLAYER_CORE_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.core.js";
+    private static final String RPLAYER_DOWNLOADS_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.downloads.js";
+    private static final String RPLAYER_VISUAL_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.visual.js";
     private static final int BUFFER_SIZE = 32 * 1024;
     private static final long SLOW_REQUEST_LOG_THRESHOLD_MS = 5000;
     private static final long CACHE_REPAIR_RETRY_DELAY_MS = 5000;
@@ -95,12 +101,51 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * Builds the local URL for direct RPlayer startup after the boot loader has succeeded once.
+     *
+     * @return local proxy URL for the configured RPlayer document
+     */
+    String rplayerUrl() {
+        return localOrigin() + IPFS_ROOT_PATH + BuildConfig.RPLAYER_INDEX_FILE;
+    }
+
+    /**
      * Builds the local album root URL accepted by native loaders.
      *
      * @return local proxy URL prefix for the configured album root
      */
     String albumRootUrl() {
         return localOrigin() + IPFS_ROOT_PATH;
+    }
+
+    /**
+     * Resolves one local proxy URL to an already verified persistent cache file.
+     *
+     * @param localUrl local proxy URL requested by the native downloader
+     * @return cached response body, or null when the URL is not cached and verified
+     */
+    File cachedFileForLocalUrl(String localUrl) {
+        try {
+            URL url = new URL(localUrl);
+            if (!"127.0.0.1".equals(url.getHost()) || url.getPort() != serverSocket.getLocalPort()) {
+                return null;
+            }
+
+            String path = url.getPath();
+            if (!isSafeAlbumPath(path)) {
+                return null;
+            }
+
+            CacheEntry cacheEntry = cacheEntryFor(path);
+            CacheMetadata metadata = CacheMetadata.load(cacheEntry.metaFile);
+            if (!cacheEntry.dataFile.isFile() || metadata == null || !isCacheEntryValid(cacheEntry, metadata)) {
+                return null;
+            }
+
+            return cacheEntry.dataFile;
+        } catch (IOException exception) {
+            return null;
+        }
     }
 
     /**
@@ -155,6 +200,11 @@ final class GatewayProxyServer implements Closeable {
 
             if (!"GET".equals(request.method) && !"HEAD".equals(request.method)) {
                 writePlainResponse(socket, 405, "Method Not Allowed", "The method is not supported.");
+                return;
+            }
+
+            if (isCacheStateRequest(request)) {
+                writeCacheStateResponse(socket, request);
                 return;
             }
 
@@ -282,11 +332,10 @@ final class GatewayProxyServer implements Closeable {
         String contentType = MimeTypes.fromPath(request.path, connection.getContentType());
         byte[] injectedResponseBody = null;
 
-        if (!"HEAD".equals(request.method) && shouldInjectHtmlBridge(request, statusCode, contentType)) {
-            byte[] originalHtmlBody = readStreamBytes(responseStream);
-            storeCompleteResponse(request, originalHtmlBody, statusCode, contentType, cacheHeadersFrom(connection));
-            String html = new String(originalHtmlBody, StandardCharsets.UTF_8);
-            injectedResponseBody = injectHtmlBridge(html).getBytes(StandardCharsets.UTF_8);
+        if (!"HEAD".equals(request.method) && shouldTransformTextResponse(request, statusCode, contentType)) {
+            byte[] originalBody = readStreamBytes(responseStream);
+            storeCompleteResponse(request, originalBody, statusCode, contentType, cacheHeadersFrom(connection));
+            injectedResponseBody = transformTextResponse(request, originalBody, contentType);
             responseStream = new ByteArrayInputStream(injectedResponseBody);
         }
 
@@ -343,6 +392,296 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * Checks whether a proxied text response needs a local viewer patch before WebView sees it.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @param contentType resolved response MIME type
+     * @return true when the response should be transformed
+     */
+    private boolean shouldTransformTextResponse(HttpRequest request, int statusCode, String contentType) {
+        return shouldInjectHtmlBridge(request, statusCode, contentType)
+            || shouldPatchRPlayerScript(request, statusCode)
+            || shouldPatchRPlayerCoreScript(request, statusCode)
+            || shouldPatchRPlayerDownloadsScript(request, statusCode)
+            || shouldPatchRPlayerVisualScript(request, statusCode);
+    }
+
+    /**
+     * Applies the selected local text response patch.
+     *
+     * @param request parsed WebView request
+     * @param body original UTF-8 response body
+     * @param contentType resolved response MIME type
+     * @return transformed UTF-8 response body
+     */
+    private byte[] transformTextResponse(HttpRequest request, byte[] body, String contentType) {
+        String text = new String(body, StandardCharsets.UTF_8);
+
+        if (shouldPatchRPlayerScript(request, 200)) {
+            return patchRPlayerScript(text).getBytes(StandardCharsets.UTF_8);
+        }
+
+        if (shouldPatchRPlayerCoreScript(request, 200)) {
+            return patchRPlayerCoreScript(text).getBytes(StandardCharsets.UTF_8);
+        }
+
+        if (shouldPatchRPlayerDownloadsScript(request, 200)) {
+            return patchRPlayerDownloadsScript(text).getBytes(StandardCharsets.UTF_8);
+        }
+
+        if (shouldPatchRPlayerVisualScript(request, 200)) {
+            return patchRPlayerVisualScript(text).getBytes(StandardCharsets.UTF_8);
+        }
+
+        return injectHtmlBridge(text).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Checks whether the main RPlayer module should expose its downloads instance to the wrapper.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @return true when rplayer.js should be patched
+     */
+    private static boolean shouldPatchRPlayerScript(HttpRequest request, int statusCode) {
+        return statusCode == 200 && RPLAYER_SCRIPT_PATH.equals(request.path);
+    }
+
+    /**
+     * Checks whether the core RPlayer module should notify the wrapper after successful initialization.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @return true when rplayer.core.js should be patched
+     */
+    private static boolean shouldPatchRPlayerCoreScript(HttpRequest request, int statusCode) {
+        return statusCode == 200 && RPLAYER_CORE_SCRIPT_PATH.equals(request.path);
+    }
+
+    /**
+     * Checks whether the downloads module should use canonical IPFS links in exported QR codes.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @return true when rplayer.downloads.js should be patched
+     */
+    private static boolean shouldPatchRPlayerDownloadsScript(HttpRequest request, int statusCode) {
+        return statusCode == 200 && RPLAYER_DOWNLOADS_SCRIPT_PATH.equals(request.path);
+    }
+
+    /**
+     * Checks whether the visual RPlayer module should use canonical IPFS links in QR codes.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @return true when rplayer.visual.js should be patched
+     */
+    private static boolean shouldPatchRPlayerVisualScript(HttpRequest request, int statusCode) {
+        return statusCode == 200 && RPLAYER_VISUAL_SCRIPT_PATH.equals(request.path);
+    }
+
+    /**
+     * Exposes the RPlayer downloads module instance without modifying the immutable IPFS content.
+     *
+     * @param script original rplayer.js source
+     * @return patched script source served only through the local proxy
+     */
+    private static String patchRPlayerScript(String script) {
+        String original = "new RPlayerDownloads(RPObj,QrCode);";
+        String patched = "window.RPlayerGatewayViewerDownloads = new RPlayerDownloads(RPObj,QrCode);";
+
+        if (!script.contains(original)) {
+            Log.w(LOG_TAG, "RPlayer downloads instance patch target was not found.");
+            return script;
+        }
+
+        Log.i(LOG_TAG, "RPlayer downloads instance exposed to viewer bridge.");
+        return script.replace(original, patched);
+    }
+
+    /**
+     * Notifies the Android wrapper when immutable RPlayer content reaches real initialization.
+     *
+     * @param script original rplayer.core.js source
+     * @return patched script source served only through the local proxy
+     */
+    private static String patchRPlayerCoreScript(String script) {
+        String original = "                that.init();";
+        String patched = original + "\n"
+            + "                if (window.RPlayerGatewayBootNative) {" + "\n"
+            + "                    window.RPlayerGatewayBootNative.markRPlayerInitialized();" + "\n"
+            + "                }";
+
+        if (!script.contains(original)) {
+            Log.w(LOG_TAG, "RPlayer initialization patch target was not found.");
+            return script;
+        }
+
+        Log.i(LOG_TAG, "RPlayer initialization signal patch applied.");
+        return script.replace(original, patched);
+    }
+
+    /**
+     * Makes exported information-page QR codes point to stable ipfs:// album URLs.
+     *
+     * @param script original rplayer.downloads.js source
+     * @return patched script source served only through the local proxy
+     */
+    private static String patchRPlayerDownloadsScript(String script) {
+        String methodAnchor = "    getHtmlBody(title = false,htmlIn) {";
+        String qrAnchor = "            QrCod.addData(this.rplayerObj.getURLAddress());";
+        String canonicalMethod = String.join("\n",
+            "    rplayerGatewayCanonicalExportQrLink(currentHref) {",
+            "        try {",
+            "            var url = new URL(currentHref);",
+            "            var pathParts = url.pathname.split('/');",
+            "            var ipfsIndex = pathParts.indexOf('ipfs');",
+            "            var cid = ipfsIndex >= 0 ? pathParts[ipfsIndex + 1] : '';",
+            "            var protocol = (this.rplayerCfg.app && this.rplayerCfg.app.web3Protocol) || 'ipfs://';",
+            "",
+            "            if (cid) {",
+            "                return protocol + cid + '/index.htm';",
+            "            }",
+            "        } catch (error) {",
+            "            console.log('[NOTICE] Export QR canonical URL fallback: ' + error.message);",
+            "        }",
+            "",
+            "        return currentHref;",
+            "    }",
+            ""
+        ) + "\n";
+
+        if (!script.contains(methodAnchor) || !script.contains(qrAnchor)) {
+            Log.w(LOG_TAG, "RPlayer export QR code patch target was not found.");
+            return script;
+        }
+
+        Log.i(LOG_TAG, "RPlayer export QR code URL patch applied.");
+        return script
+            .replace(methodAnchor, canonicalMethod + methodAnchor)
+            .replace(qrAnchor, "            QrCod.addData(this.rplayerGatewayCanonicalExportQrLink(this.rplayerObj.getURLAddress()));");
+    }
+
+    /**
+     * Makes RPlayer QR codes point to stable ipfs:// album URLs instead of localhost proxy URLs.
+     *
+     * @param script original rplayer.visual.js source
+     * @return patched script source served only through the local proxy
+     */
+    private static String patchRPlayerVisualScript(String script) {
+        String methodAnchor = "    showQrCode() {";
+        String linkAnchor = "        link = window.location.href;";
+        String canonicalMethod = String.join("\n",
+            "    rplayerGatewayCanonicalQrLink(currentHref) {",
+            "        try {",
+            "            var url = new URL(currentHref);",
+            "            var pathParts = url.pathname.split('/');",
+            "            var ipfsIndex = pathParts.indexOf('ipfs');",
+            "            var cid = ipfsIndex >= 0 ? pathParts[ipfsIndex + 1] : '';",
+            "            var protocol = this.rplayerObj.rplayerCfg.conf.app.web3Protocol || 'ipfs://';",
+            "",
+            "            if (cid) {",
+            "                return protocol + cid + '/index.htm';",
+            "            }",
+            "        } catch (error) {",
+            "            console.log('[NOTICE] QR canonical URL fallback: ' + error.message);",
+            "        }",
+            "",
+            "        return currentHref;",
+            "    }",
+            ""
+        ) + "\n";
+
+        if (!script.contains(methodAnchor) || !script.contains(linkAnchor)) {
+            Log.w(LOG_TAG, "RPlayer QR code patch target was not found.");
+            return script;
+        }
+
+        Log.i(LOG_TAG, "RPlayer QR code URL patch applied.");
+        return script
+            .replace(methodAnchor, canonicalMethod + methodAnchor)
+            .replace(linkAnchor, "        link = this.rplayerGatewayCanonicalQrLink(window.location.href);");
+    }
+
+    /**
+     * Checks whether a local request asks for wrapper cache state JSON.
+     *
+     * @param request parsed WebView request
+     * @return true for the internal cache state endpoint
+     */
+    private static boolean isCacheStateRequest(HttpRequest request) {
+        return request.path.startsWith("/__rplayer_gateway/cache-state?");
+    }
+
+    /**
+     * Writes current persistent cache state for one safe album path.
+     *
+     * @param socket target socket connected to WebView
+     * @param request parsed WebView request
+     * @throws IOException when the response cannot be written
+     */
+    private void writeCacheStateResponse(Socket socket, HttpRequest request) throws IOException {
+        String checkedPath = queryParameter(request.path, "path");
+        boolean complete = isCompleteCachedPath(checkedPath);
+        byte[] body = ("{\"complete\":" + complete + "}").getBytes(StandardCharsets.UTF_8);
+
+        BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
+        outputStream.write("HTTP/1.1 200 OK\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        writeHeader(outputStream, "Content-Type", "application/json; charset=utf-8");
+        writeHeader(outputStream, "Cache-Control", "no-store");
+        writeHeader(outputStream, "Connection", "close");
+        writeHeader(outputStream, "Content-Length", String.valueOf(body.length));
+        outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        outputStream.write(body);
+        outputStream.flush();
+    }
+
+    /**
+     * Checks whether a safe album path has a complete valid persistent cache entry.
+     *
+     * @param path local IPFS path to check
+     * @return true when the cached file exists and passes local validation
+     */
+    private boolean isCompleteCachedPath(String path) {
+        if (!isSafeAlbumPath(path)) {
+            return false;
+        }
+
+        CacheEntry cacheEntry = cacheEntryFor(path);
+        CacheMetadata metadata = CacheMetadata.load(cacheEntry.metaFile);
+        return cacheEntry.dataFile.isFile() && metadata != null && isCacheEntryValid(cacheEntry, metadata);
+    }
+
+    /**
+     * Reads one URL query parameter from a local endpoint path.
+     *
+     * @param requestPath endpoint path with query string
+     * @param name query parameter name
+     * @return decoded parameter value, or an empty string when missing
+     */
+    private static String queryParameter(String requestPath, String name) {
+        int queryStart = requestPath.indexOf('?');
+        if (queryStart < 0 || queryStart >= requestPath.length() - 1) {
+            return "";
+        }
+
+        String prefix = name + "=";
+        String[] pairs = requestPath.substring(queryStart + 1).split("&");
+        for (String pair : pairs) {
+            if (pair.startsWith(prefix)) {
+                try {
+                    return URLDecoder.decode(pair.substring(prefix.length()), StandardCharsets.UTF_8.name());
+                } catch (IllegalArgumentException | java.io.UnsupportedEncodingException exception) {
+                    return "";
+                }
+            }
+        }
+
+        return "";
+    }
+
+    /**
      * Checks whether a local request path is inside the fixed album root and safe to proxy.
      *
      * Path is expected to be the normalized local request path.
@@ -369,7 +708,7 @@ final class GatewayProxyServer implements Closeable {
      * @throws IOException when the cached response cannot be written
      */
     private boolean serveFromCacheIfPossible(Socket socket, HttpRequest request) throws IOException {
-        if (!isCompleteCacheRequest(request)) {
+        if (!isCacheLookupRequest(request)) {
             return false;
         }
 
@@ -378,6 +717,9 @@ final class GatewayProxyServer implements Closeable {
 
         if (!cacheEntry.dataFile.isFile() || metadata == null) {
             Log.i(LOG_TAG, "Persistent cache miss: " + request.path);
+            if (isAlbumAudioRangeRequest(request)) {
+                scheduleCacheRepair(request.path, "audio range cache miss");
+            }
             return false;
         }
 
@@ -386,6 +728,18 @@ final class GatewayProxyServer implements Closeable {
             deleteCacheEntry(cacheEntry);
             scheduleCacheRepair(request.path, "invalid cache hit");
             return false;
+        }
+
+        if (isRangeRequest(request)) {
+            RangeRequest rangeRequest = parseRangeRequest(request.headers.get("range"), cacheEntry.dataFile.length());
+            if (rangeRequest == null) {
+                writeRangeNotSatisfiableResponse(socket, cacheEntry.dataFile.length());
+                return true;
+            }
+
+            Log.i(LOG_TAG, "Persistent cache range hit: " + request.path + rangeLogSuffix(request));
+            writeCachedRangeResponse(socket, cacheEntry.dataFile, metadata, rangeRequest);
+            return true;
         }
 
         Log.i(LOG_TAG, "Persistent cache hit: " + request.path);
@@ -407,8 +761,8 @@ final class GatewayProxyServer implements Closeable {
         byte[] body = null;
         long contentLength = dataFile.length();
 
-        if (shouldInjectHtmlBridge(request, 200, metadata.contentType)) {
-            body = injectHtmlBridge(new String(readStreamBytes(inputStream), StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
+        if (shouldTransformTextResponse(request, 200, metadata.contentType)) {
+            body = transformTextResponse(request, readStreamBytes(inputStream), metadata.contentType);
             closeQuietly(inputStream);
             inputStream = new ByteArrayInputStream(body);
             contentLength = body.length;
@@ -443,6 +797,68 @@ final class GatewayProxyServer implements Closeable {
         copyStream(inputStream, outputStream);
         outputStream.flush();
         closeQuietly(inputStream);
+    }
+
+    /**
+     * Writes one byte range from a complete cached response.
+     *
+     * @param socket target socket connected to WebView
+     * @param dataFile cached original response body
+     * @param metadata cached response metadata
+     * @param rangeRequest requested byte range resolved against the cached file length
+     * @throws IOException when the cached response cannot be read or written
+     */
+    private void writeCachedRangeResponse(Socket socket, File dataFile, CacheMetadata metadata, RangeRequest rangeRequest) throws IOException {
+        BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
+        outputStream.write("HTTP/1.1 206 Partial Content\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        writeHeader(outputStream, "Content-Type", metadata.contentType);
+        writeHeader(outputStream, "Access-Control-Allow-Origin", "*");
+        writeHeader(outputStream, "Accept-Ranges", "bytes");
+        writeHeader(outputStream, "Cache-Control", CACHE_CONTROL_VALUE);
+        writeHeader(outputStream, "Connection", "close");
+        writeHeader(outputStream, "Content-Length", String.valueOf(rangeRequest.length()));
+        writeHeader(
+            outputStream,
+            "Content-Range",
+            "bytes " + rangeRequest.start + "-" + rangeRequest.end + "/" + rangeRequest.totalLength
+        );
+
+        if (!metadata.lastModified.isEmpty()) {
+            writeHeader(outputStream, "Last-Modified", metadata.lastModified);
+        }
+
+        if (!metadata.etag.isEmpty()) {
+            writeHeader(outputStream, "ETag", metadata.etag);
+        }
+
+        if (!metadata.ipfsPath.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Path", metadata.ipfsPath);
+        }
+
+        if (!metadata.ipfsRoots.isEmpty()) {
+            writeHeader(outputStream, "X-Ipfs-Roots", metadata.ipfsRoots);
+        }
+
+        outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        copyFileRange(dataFile, outputStream, rangeRequest.start, rangeRequest.length());
+        outputStream.flush();
+    }
+
+    /**
+     * Writes an HTTP 416 response for an unsatisfiable cached range request.
+     *
+     * @param socket target socket connected to WebView
+     * @param totalLength complete cached file length
+     * @throws IOException when the response cannot be written
+     */
+    private void writeRangeNotSatisfiableResponse(Socket socket, long totalLength) throws IOException {
+        BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
+        outputStream.write("HTTP/1.1 416 Range Not Satisfiable\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        writeHeader(outputStream, "Content-Range", "bytes */" + totalLength);
+        writeHeader(outputStream, "Content-Length", "0");
+        writeHeader(outputStream, "Connection", "close");
+        outputStream.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        outputStream.flush();
     }
 
     /**
@@ -580,7 +996,7 @@ final class GatewayProxyServer implements Closeable {
             return;
         }
 
-        metadata.save(cacheEntry.metaFile);
+        metadata.asVerified().save(cacheEntry.metaFile);
         Log.i(
             LOG_TAG,
             "Persistent cache stored: "
@@ -621,16 +1037,45 @@ final class GatewayProxyServer implements Closeable {
      * @return true when the cached response can be served without refetching
      */
     private boolean isCacheEntryValid(CacheEntry cacheEntry, CacheMetadata metadata) {
+        if (metadata.verified) {
+            return isVerifiedCacheEntryUsable(cacheEntry.dataFile, metadata);
+        }
+
         if (!isCacheCandidateValid(cacheEntry.dataFile, metadata)) {
             return false;
         }
 
         try {
-            return metadata.sha256.equals(sha256(cacheEntry.dataFile));
+            boolean valid = metadata.sha256.equals(sha256(cacheEntry.dataFile));
+            if (valid) {
+                metadata.asVerified().save(cacheEntry.metaFile);
+                Log.i(LOG_TAG, "Persistent cache verified: " + cacheEntry.dataFile.getName());
+            }
+
+            return valid;
         } catch (IOException exception) {
             Log.w(LOG_TAG, "Persistent cache SHA-256 check failed: " + cacheEntry.dataFile.getName(), exception);
             return false;
         }
+    }
+
+    /**
+     * Checks fast metadata invariants for an already verified cache entry.
+     *
+     * @param dataFile cached body file
+     * @param metadata metadata loaded from disk
+     * @return true when the cached response can be trusted without hashing again
+     */
+    private boolean isVerifiedCacheEntryUsable(File dataFile, CacheMetadata metadata) {
+        if (!dataFile.isFile() || metadata.actualContentLength != dataFile.length()) {
+            return false;
+        }
+
+        if (metadata.expectedContentLength >= 0 && metadata.expectedContentLength != dataFile.length()) {
+            return false;
+        }
+
+        return !metadata.sha256.isEmpty() && hasUsableIpfsIdentity(metadata);
     }
 
     /**
@@ -968,13 +1413,103 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * Decides whether the request can consult the persistent cache.
+     *
+     * @param request parsed WebView request
+     * @return true when a complete cached file could answer the request
+     */
+    private static boolean isCacheLookupRequest(HttpRequest request) {
+        return "GET".equals(request.method);
+    }
+
+    /**
      * Decides whether the request is safe for the simple complete-response cache.
      *
      * @param request parsed WebView request
      * @return true when the request can be cached only as a complete response
      */
     private static boolean isCompleteCacheRequest(HttpRequest request) {
-        return "GET".equals(request.method) && !request.headers.containsKey("range");
+        return "GET".equals(request.method) && !isRangeRequest(request);
+    }
+
+    /**
+     * Checks whether WebView requested a byte range.
+     *
+     * @param request parsed WebView request
+     * @return true when a Range header is present
+     */
+    private static boolean isRangeRequest(HttpRequest request) {
+        String range = request.headers.get("range");
+        return range != null && !range.trim().isEmpty();
+    }
+
+    /**
+     * Checks whether a Range request targets the main album audio class of files.
+     *
+     * @param request parsed WebView request
+     * @return true when the request should trigger complete background audio caching
+     */
+    private static boolean isAlbumAudioRangeRequest(HttpRequest request) {
+        String lowerPath = request.path.toLowerCase(Locale.ROOT);
+        return isRangeRequest(request)
+            && (lowerPath.endsWith(".m4a")
+                || lowerPath.endsWith(".mp3")
+                || lowerPath.endsWith(".aac")
+                || lowerPath.endsWith(".ogg")
+                || lowerPath.endsWith(".flac")
+                || lowerPath.endsWith(".wav"));
+    }
+
+    /**
+     * Parses one HTTP byte range against a complete local file length.
+     *
+     * @param rangeHeader raw Range header value
+     * @param totalLength complete cached file length
+     * @return parsed range, or null when the request is invalid or unsatisfiable
+     */
+    private static RangeRequest parseRangeRequest(String rangeHeader, long totalLength) {
+        if (rangeHeader == null || totalLength <= 0) {
+            return null;
+        }
+
+        String range = rangeHeader.trim().toLowerCase(Locale.ROOT);
+        if (!range.startsWith("bytes=") || range.indexOf(',') >= 0) {
+            return null;
+        }
+
+        String value = range.substring("bytes=".length()).trim();
+        int separator = value.indexOf('-');
+        if (separator < 0) {
+            return null;
+        }
+
+        try {
+            String startText = value.substring(0, separator).trim();
+            String endText = value.substring(separator + 1).trim();
+            long start;
+            long end;
+
+            if (startText.isEmpty()) {
+                long suffixLength = Long.parseLong(endText);
+                if (suffixLength <= 0) {
+                    return null;
+                }
+
+                start = Math.max(0, totalLength - suffixLength);
+                end = totalLength - 1;
+            } else {
+                start = Long.parseLong(startText);
+                end = endText.isEmpty() ? totalLength - 1 : Long.parseLong(endText);
+            }
+
+            if (start < 0 || end < start || start >= totalLength) {
+                return null;
+            }
+
+            return new RangeRequest(start, Math.min(end, totalLength - 1), totalLength);
+        } catch (NumberFormatException exception) {
+            return null;
+        }
     }
 
     /**
@@ -1028,6 +1563,33 @@ final class GatewayProxyServer implements Closeable {
     private static String safeTemporaryNamePart(String value) {
         String safeValue = value == null ? "cache" : value.toLowerCase(Locale.ROOT);
         return safeValue.replaceAll("[^a-z0-9_-]", "_");
+    }
+
+    /**
+     * Copies a selected byte range from one file to the response stream.
+     *
+     * @param file source file
+     * @param outputStream target response stream
+     * @param start first byte offset to copy
+     * @param length number of bytes to copy
+     * @throws IOException when file reading or response writing fails
+     */
+    private static void copyFileRange(File file, BufferedOutputStream outputStream, long start, long length) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        long remaining = length;
+
+        try (RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r")) {
+            randomAccessFile.seek(start);
+            while (remaining > 0) {
+                int read = randomAccessFile.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                if (read < 0) {
+                    return;
+                }
+
+                outputStream.write(buffer, 0, read);
+                remaining -= read;
+            }
+        }
     }
 
     /**
@@ -1173,6 +1735,37 @@ final class GatewayProxyServer implements Closeable {
     }
 
     /**
+     * One satisfiable byte range inside a complete cached file.
+     */
+    private static final class RangeRequest {
+        private final long start;
+        private final long end;
+        private final long totalLength;
+
+        /**
+         * Creates one byte range resolved against a complete cached file.
+         *
+         * @param start first requested byte offset
+         * @param end last requested byte offset
+         * @param totalLength complete cached file length
+         */
+        private RangeRequest(long start, long end, long totalLength) {
+            this.start = start;
+            this.end = end;
+            this.totalLength = totalLength;
+        }
+
+        /**
+         * Returns the number of bytes in this range.
+         *
+         * @return byte count to send
+         */
+        private long length() {
+            return end - start + 1;
+        }
+    }
+
+    /**
      * Metadata collected from one gateway response for cache validation.
      */
     private static final class CacheResponseHeaders {
@@ -1216,6 +1809,7 @@ final class GatewayProxyServer implements Closeable {
         private final long expectedContentLength;
         private final long actualContentLength;
         private final String sha256;
+        private final boolean verified;
 
         /**
          * Creates immutable cache response metadata.
@@ -1226,15 +1820,17 @@ final class GatewayProxyServer implements Closeable {
          * @param sha256 local SHA-256 of cached body bytes
          */
         private CacheMetadata(String contentType, CacheResponseHeaders cacheHeaders, long actualContentLength, String sha256) {
-            String safeContentType = safeHeaderValue(contentType);
-            this.contentType = safeContentType.isEmpty() ? "application/octet-stream" : safeContentType;
-            this.lastModified = cacheHeaders.lastModified;
-            this.etag = cacheHeaders.etag;
-            this.ipfsPath = cacheHeaders.ipfsPath;
-            this.ipfsRoots = cacheHeaders.ipfsRoots;
-            this.expectedContentLength = cacheHeaders.expectedContentLength;
-            this.actualContentLength = actualContentLength;
-            this.sha256 = safeHeaderValue(sha256);
+            this(
+                contentType,
+                cacheHeaders.lastModified,
+                cacheHeaders.etag,
+                cacheHeaders.ipfsPath,
+                cacheHeaders.ipfsRoots,
+                cacheHeaders.expectedContentLength,
+                actualContentLength,
+                sha256,
+                false
+            );
         }
 
         /**
@@ -1248,7 +1844,8 @@ final class GatewayProxyServer implements Closeable {
             String ipfsRoots,
             long expectedContentLength,
             long actualContentLength,
-            String sha256
+            String sha256,
+            boolean verified
         ) {
             String safeContentType = safeHeaderValue(contentType);
             this.contentType = safeContentType.isEmpty() ? "application/octet-stream" : safeContentType;
@@ -1259,6 +1856,30 @@ final class GatewayProxyServer implements Closeable {
             this.expectedContentLength = expectedContentLength;
             this.actualContentLength = actualContentLength;
             this.sha256 = safeHeaderValue(sha256);
+            this.verified = verified;
+        }
+
+        /**
+         * Creates a copy that can skip expensive validation on future cache hits.
+         *
+         * @return metadata marked as already verified
+         */
+        private CacheMetadata asVerified() {
+            if (verified) {
+                return this;
+            }
+
+            return new CacheMetadata(
+                contentType,
+                lastModified,
+                etag,
+                ipfsPath,
+                ipfsRoots,
+                expectedContentLength,
+                actualContentLength,
+                sha256,
+                true
+            );
         }
 
         /**
@@ -1274,7 +1895,7 @@ final class GatewayProxyServer implements Closeable {
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
                 String version = reader.readLine();
-                if (!"cache-v2".equals(version)) {
+                if (!"cache-v2".equals(version) && !"cache-v3".equals(version)) {
                     return null;
                 }
 
@@ -1286,6 +1907,7 @@ final class GatewayProxyServer implements Closeable {
                 long expectedContentLength = Long.parseLong(reader.readLine());
                 long actualContentLength = Long.parseLong(reader.readLine());
                 String sha256 = reader.readLine();
+                boolean verified = "cache-v3".equals(version) && Boolean.parseBoolean(reader.readLine());
                 return new CacheMetadata(
                     contentType,
                     lastModified,
@@ -1294,7 +1916,8 @@ final class GatewayProxyServer implements Closeable {
                     ipfsRoots,
                     expectedContentLength,
                     actualContentLength,
-                    sha256
+                    sha256,
+                    verified
                 );
             } catch (IOException | RuntimeException exception) {
                 return null;
@@ -1309,7 +1932,7 @@ final class GatewayProxyServer implements Closeable {
          */
         private void save(File file) throws IOException {
             try (FileOutputStream outputStream = new FileOutputStream(file)) {
-                String text = "cache-v2\n"
+                String text = "cache-v3\n"
                     + contentType + "\n"
                     + lastModified + "\n"
                     + etag + "\n"
@@ -1317,7 +1940,8 @@ final class GatewayProxyServer implements Closeable {
                     + ipfsRoots + "\n"
                     + expectedContentLength + "\n"
                     + actualContentLength + "\n"
-                    + sha256 + "\n";
+                    + sha256 + "\n"
+                    + verified + "\n";
                 outputStream.write(text.getBytes(StandardCharsets.UTF_8));
             }
         }
