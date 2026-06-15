@@ -44,16 +44,6 @@ Release builds use the same flavor names:
 
 The build command may need Android SDK and Java available on the host machine.
 
-## Release Verification
-
-The `0.1.5-build-37` release APK files are mirrored on IPFS and have public VirusTotal reports:
-
-| APK | IPFS mirror | VirusTotal |
-| --- | --- | --- |
-| [`unexpectedTracks-0.1.5-build-37-release-signed.apk`](https://github.com/entlaabstudio/rplayer-gateway-viewer/releases/download/v0.1.5/unexpectedTracks-0.1.5-build-37-release-signed.apk) | https://bafybeiaplogko4xh5ejx437rxxtyquykjomvjary2qkcji3qb7cgabnlwi.ipfs.dweb.link?filename=unexpectedTracks-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/cfd66dee7e0b0a80e50380fbc1363dae9525cfe88a564c50ceea3ee22224a792/details |
-| [`dreamer-0.1.5-build-37-release-signed.apk`](https://github.com/entlaabstudio/rplayer-gateway-viewer/releases/download/v0.1.5/dreamer-0.1.5-build-37-release-signed.apk) | https://bafybeigjnvd2jduytqgaizux57jhbkprjl4pqxfv2b67hn2pvbai23qxye.ipfs.dweb.link?filename=dreamer-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/b8c1b3a20d06014a76947c90e1527a226a275c936b4ac4737124eb3d3df24ad9/details |
-| [`krehkyMechanismus-0.1.5-build-37-release-signed.apk`](https://github.com/entlaabstudio/rplayer-gateway-viewer/releases/download/v0.1.5/krehkyMechanismus-0.1.5-build-37-release-signed.apk) | https://bafybeidgkzctvp7dzza5i5ngd6yzabejr5pwatoqgiy2fi2rldqmopecg4.ipfs.dweb.link?filename=krehkyMechanismus-0.1.5-build-37-release-signed.apk | https://www.virustotal.com/gui/file/f0b177a40b6183927116527015fe57ab9aacfd44cb46d7933361384b711370a7/details |
-
 ## Signing
 
 Release APK files can be signed after a release build with one password prompt:
