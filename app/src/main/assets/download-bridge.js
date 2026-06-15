@@ -175,7 +175,7 @@
 
         if (typeof data === 'string') {
             window.RPlayerGatewayDownloads.log('Native ZIP text entry: ' + path + ' (' + data.length + ' chars)');
-            window.RPlayerGatewayDownloads.addNativeZipTextEntry(this.archive.downloadId, path, data);
+            window.RPlayerGatewayDownloads.addNativeZipTextEntry(this.archive.downloadId, path, rewriteLocalIpfsLinks(data));
             return this;
         }
 
@@ -500,23 +500,23 @@
     }
 
     /**
-     * Rewrites local proxy IPFS links in ID3 text metadata to canonical ipfs:// links.
+     * Rewrites local proxy IPFS links in exported text to canonical ipfs:// links.
      *
-     * @param {*} value Metadata value to rewrite.
-     * @returns {*} Metadata value with stable IPFS links.
+     * @param {*} value Text or metadata value to rewrite.
+     * @returns {*} Value with stable IPFS links.
      */
-    function rewriteId3IpfsLinks(value) {
+    function rewriteLocalIpfsLinks(value) {
         var localIpfsRoot;
         var localIpfsPattern;
         var subdomainIpfsPattern;
 
         if (Array.isArray(value)) {
-            return value.map(rewriteId3IpfsLinks);
+            return value.map(rewriteLocalIpfsLinks);
         }
 
         if (value && typeof value === 'object') {
             return Object.keys(value).reduce(function(result, key) {
-                result[key] = rewriteId3IpfsLinks(value[key]);
+                result[key] = rewriteLocalIpfsLinks(value[key]);
                 return result;
             }, {});
         }
@@ -564,7 +564,7 @@
             year: albumInfo.year || ''
         };
 
-        metadata = rewriteId3IpfsLinks(metadata);
+        metadata = rewriteLocalIpfsLinks(metadata);
 
         if (isBundleOptionChecked('ImagesToMp3') && entry.srcImgFile) {
             metadata.coverImageUrl = resolveSourceUrl(entry.srcImgFile);
@@ -725,7 +725,7 @@
         }
 
         window.RPlayerGatewayDownloads.log('Native ZIP text entry queued: ' + entry.path + ' (' + String(entry.text || '').length + ' chars)');
-        window.RPlayerGatewayDownloads.addNativeZipTextEntry(downloadId, entry.path, entry.text || '');
+        window.RPlayerGatewayDownloads.addNativeZipTextEntry(downloadId, entry.path, rewriteLocalIpfsLinks(entry.text || ''));
     }
 
     /**
@@ -798,7 +798,7 @@
         }
 
         window.RPlayerGatewayDownloads.log('Native folder text entry queued: ' + entry.path + ' (' + String(entry.text || '').length + ' chars)');
-        window.RPlayerGatewayDownloads.addNativeFolderTextEntry(downloadId, entry.path, entry.text || '');
+        window.RPlayerGatewayDownloads.addNativeFolderTextEntry(downloadId, entry.path, rewriteLocalIpfsLinks(entry.text || ''));
     }
 
     /**
