@@ -20,6 +20,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.util.Log;
@@ -128,6 +129,8 @@ public final class MainActivity extends Activity {
     private long currentMediaDurationMs = -1;
     private int currentPlaybackState = PlaybackState.STATE_NONE;
     private boolean playbackForegroundServiceActive;
+    private boolean exportForegroundServiceActive;
+    private PowerManager.WakeLock exportWakeLock;
     private boolean mainFrameLoadFailed;
     private boolean viewerRetryPending;
     private boolean directRPlayerStartupActive;
@@ -258,6 +261,7 @@ public final class MainActivity extends Activity {
         closeActiveDownloadSession();
         cancelMissingExternalAppToast();
         stopPlaybackForegroundService();
+        stopExportForegroundService();
         cancelMediaNotification();
 
         if (pendingDownload != null) {
@@ -996,6 +1000,8 @@ public final class MainActivity extends Activity {
      * @param currentEntry current ZIP entry path or empty text
      */
     private void dispatchNativeZipProgress(int completedEntries, int expectedEntries, String currentEntry) {
+        updateExportForegroundService(completedEntries, expectedEntries, currentEntry);
+
         if (webView == null) {
             return;
         }
@@ -1361,6 +1367,129 @@ public final class MainActivity extends Activity {
     }
 
     /**
+     * Starts the foreground export service while Android writes a user-started album export.
+     *
+     * @param title title shown in the Android export notification
+     */
+    private void startExportForegroundService(String title) {
+        exportForegroundServiceActive = true;
+        acquireExportWakeLock();
+
+        Intent intent = exportForegroundIntent(ExportForegroundService.ACTION_START, title, 0, 0, "Preparing export");
+        startForegroundAwareService(intent);
+    }
+
+    /**
+     * Updates the foreground export service from native export progress.
+     *
+     * @param completedEntries number of finished export entries
+     * @param expectedEntries expected number of export entries
+     * @param currentEntry current export entry path or status text
+     */
+    private void updateExportForegroundService(int completedEntries, int expectedEntries, String currentEntry) {
+        if (!exportForegroundServiceActive || completedEntries < 0) {
+            return;
+        }
+
+        Intent intent = exportForegroundIntent(
+            ExportForegroundService.ACTION_UPDATE,
+            "Exporting album",
+            completedEntries,
+            expectedEntries,
+            currentEntry
+        );
+        startForegroundAwareService(intent);
+    }
+
+    /**
+     * Stops the foreground export service and releases the export wake lock.
+     */
+    private void stopExportForegroundService() {
+        releaseExportWakeLock();
+
+        if (!exportForegroundServiceActive) {
+            return;
+        }
+
+        exportForegroundServiceActive = false;
+        stopService(new Intent(this, ExportForegroundService.class));
+    }
+
+    /**
+     * Builds an Intent carrying export foreground notification state.
+     *
+     * @param action foreground export service action
+     * @param title notification title
+     * @param completedEntries number of finished export entries
+     * @param expectedEntries expected number of export entries
+     * @param currentEntry current export entry path or status text
+     * @return Intent addressed to ExportForegroundService
+     */
+    private Intent exportForegroundIntent(
+        String action,
+        String title,
+        int completedEntries,
+        int expectedEntries,
+        String currentEntry
+    ) {
+        Intent intent = new Intent(this, ExportForegroundService.class);
+        intent.setAction(action);
+        intent.putExtra(ExportForegroundService.EXTRA_TITLE, title);
+        intent.putExtra(ExportForegroundService.EXTRA_COMPLETED_ENTRIES, completedEntries);
+        intent.putExtra(ExportForegroundService.EXTRA_EXPECTED_ENTRIES, expectedEntries);
+        intent.putExtra(ExportForegroundService.EXTRA_CURRENT_ENTRY, currentEntry == null ? "" : currentEntry);
+        return intent;
+    }
+
+    /**
+     * Starts a service with Android's foreground-service API when required.
+     *
+     * @param intent service Intent to start
+     */
+    private void startForegroundAwareService(Intent intent) {
+        if (usesForegroundServiceStartApi()) {
+            startForegroundService(intent);
+            return;
+        }
+
+        startService(intent);
+    }
+
+    /**
+     * Keeps the CPU awake while a foreground album export is actively writing files.
+     */
+    @SuppressLint("WakelockTimeout")
+    private void acquireExportWakeLock() {
+        if (exportWakeLock == null) {
+            PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+            if (powerManager == null) {
+                return;
+            }
+
+            exportWakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                BuildConfig.APPLICATION_ID + ":albumExport"
+            );
+            exportWakeLock.setReferenceCounted(false);
+        }
+
+        if (!exportWakeLock.isHeld()) {
+            exportWakeLock.acquire();
+            Log.i(LOG_TAG, "Native export wake lock acquired.");
+        }
+    }
+
+    /**
+     * Releases the CPU wake lock held for an active album export.
+     */
+    private void releaseExportWakeLock() {
+        if (exportWakeLock != null && exportWakeLock.isHeld()) {
+            exportWakeLock.release();
+            Log.i(LOG_TAG, "Native export wake lock released.");
+        }
+    }
+
+    /**
      * Checks whether Android requires notification channels.
      *
      * Returns true when notifications must be assigned to a channel.
@@ -1611,6 +1740,7 @@ public final class MainActivity extends Activity {
                 );
             }
 
+            startExportForegroundService("Exporting ZIP file");
             Log.i(LOG_TAG, "Native ZIP direct download started: " + pendingZip.fileName);
             notifyNativeZipDestinationReady(pendingZip.downloadId);
         } catch (IOException exception) {
@@ -1691,6 +1821,7 @@ public final class MainActivity extends Activity {
                 );
             }
 
+            startExportForegroundService("Exporting folder");
             Log.i(LOG_TAG, "Native folder export destination selected for: " + pendingFolder.folderName);
             notifyNativeFolderDestinationReady(pendingFolder.downloadId);
         } catch (IllegalArgumentException exception) {
@@ -1803,6 +1934,7 @@ public final class MainActivity extends Activity {
         }
         deleteTempFile(activeDownloadSession.file);
         activeDownloadSession = null;
+        stopExportForegroundService();
     }
 
     /**
@@ -2073,6 +2205,7 @@ public final class MainActivity extends Activity {
                     zipOutputStream
                 );
 
+                startExportForegroundService("Exporting ZIP file");
                 Log.i(LOG_TAG, "Native ZIP download started.");
             } catch (IOException exception) {
                 Log.e(LOG_TAG, "Native ZIP file could not be created.", exception);
@@ -2372,6 +2505,7 @@ public final class MainActivity extends Activity {
                     + ", entries=" + session.zipEntryCount
                     + ", bytes=" + session.receivedBytes);
                 reportNativeZipProgress(session, "");
+                stopExportForegroundService();
             });
         }
 
@@ -2462,6 +2596,7 @@ public final class MainActivity extends Activity {
                     + ", entries=" + session.zipEntryCount
                     + ", bytes=" + session.receivedBytes);
                 reportNativeZipProgress(session, "");
+                stopExportForegroundService();
             });
         }
 
