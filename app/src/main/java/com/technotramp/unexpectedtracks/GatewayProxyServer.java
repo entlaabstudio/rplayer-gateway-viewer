@@ -49,6 +49,7 @@ final class GatewayProxyServer implements Closeable {
     private static final String ROOT_PATH = IPFS_ROOT_PATH + ENTRY_FILE;
     private static final String RPLAYER_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.js";
     private static final String RPLAYER_CORE_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.core.js";
+    private static final String RPLAYER_DOWNLOADS_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.downloads.js";
     private static final String RPLAYER_VISUAL_SCRIPT_PATH = IPFS_ROOT_PATH + "src/js/rplayer.modules/rplayer.visual.js";
     private static final int BUFFER_SIZE = 32 * 1024;
     private static final long SLOW_REQUEST_LOG_THRESHOLD_MS = 5000;
@@ -402,6 +403,7 @@ final class GatewayProxyServer implements Closeable {
         return shouldInjectHtmlBridge(request, statusCode, contentType)
             || shouldPatchRPlayerScript(request, statusCode)
             || shouldPatchRPlayerCoreScript(request, statusCode)
+            || shouldPatchRPlayerDownloadsScript(request, statusCode)
             || shouldPatchRPlayerVisualScript(request, statusCode);
     }
 
@@ -422,6 +424,10 @@ final class GatewayProxyServer implements Closeable {
 
         if (shouldPatchRPlayerCoreScript(request, 200)) {
             return patchRPlayerCoreScript(text).getBytes(StandardCharsets.UTF_8);
+        }
+
+        if (shouldPatchRPlayerDownloadsScript(request, 200)) {
+            return patchRPlayerDownloadsScript(text).getBytes(StandardCharsets.UTF_8);
         }
 
         if (shouldPatchRPlayerVisualScript(request, 200)) {
@@ -451,6 +457,17 @@ final class GatewayProxyServer implements Closeable {
      */
     private static boolean shouldPatchRPlayerCoreScript(HttpRequest request, int statusCode) {
         return statusCode == 200 && RPLAYER_CORE_SCRIPT_PATH.equals(request.path);
+    }
+
+    /**
+     * Checks whether the downloads module should use canonical IPFS links in exported QR codes.
+     *
+     * @param request parsed WebView request
+     * @param statusCode gateway or cached response status
+     * @return true when rplayer.downloads.js should be patched
+     */
+    private static boolean shouldPatchRPlayerDownloadsScript(HttpRequest request, int statusCode) {
+        return statusCode == 200 && RPLAYER_DOWNLOADS_SCRIPT_PATH.equals(request.path);
     }
 
     /**
@@ -503,6 +520,47 @@ final class GatewayProxyServer implements Closeable {
 
         Log.i(LOG_TAG, "RPlayer initialization signal patch applied.");
         return script.replace(original, patched);
+    }
+
+    /**
+     * Makes exported information-page QR codes point to stable ipfs:// album URLs.
+     *
+     * @param script original rplayer.downloads.js source
+     * @return patched script source served only through the local proxy
+     */
+    private static String patchRPlayerDownloadsScript(String script) {
+        String methodAnchor = "    getHtmlBody(title = false,htmlIn) {";
+        String qrAnchor = "            QrCod.addData(this.rplayerObj.getURLAddress());";
+        String canonicalMethod = String.join("\n",
+            "    rplayerGatewayCanonicalExportQrLink(currentHref) {",
+            "        try {",
+            "            var url = new URL(currentHref);",
+            "            var pathParts = url.pathname.split('/');",
+            "            var ipfsIndex = pathParts.indexOf('ipfs');",
+            "            var cid = ipfsIndex >= 0 ? pathParts[ipfsIndex + 1] : '';",
+            "            var protocol = (this.rplayerCfg.app && this.rplayerCfg.app.web3Protocol) || 'ipfs://';",
+            "",
+            "            if (cid) {",
+            "                return protocol + cid + '/index.htm';",
+            "            }",
+            "        } catch (error) {",
+            "            console.log('[NOTICE] Export QR canonical URL fallback: ' + error.message);",
+            "        }",
+            "",
+            "        return currentHref;",
+            "    }",
+            ""
+        ) + "\n";
+
+        if (!script.contains(methodAnchor) || !script.contains(qrAnchor)) {
+            Log.w(LOG_TAG, "RPlayer export QR code patch target was not found.");
+            return script;
+        }
+
+        Log.i(LOG_TAG, "RPlayer export QR code URL patch applied.");
+        return script
+            .replace(methodAnchor, canonicalMethod + methodAnchor)
+            .replace(qrAnchor, "            QrCod.addData(this.rplayerGatewayCanonicalExportQrLink(this.rplayerObj.getURLAddress()));");
     }
 
     /**
