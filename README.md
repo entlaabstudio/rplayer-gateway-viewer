@@ -28,13 +28,27 @@ The viewer does not launch a general-purpose browser. Android WebView loads a lo
 
 The project is prepared for Gradle with the Android plugin, and can also be opened in Android Studio.
 
+Build all debug APK variants:
+
+```sh
+./gradlew assembleDebug
+```
+
+Build all release APK variants:
+
+```sh
+./gradlew assembleRelease
+```
+
+Individual debug builds use the flavor names:
+
 ```sh
 ./gradlew :app:assembleUnexpectedTracksDebug
 ./gradlew :app:assembleDreamerDebug
 ./gradlew :app:assembleKrehkyMechanismusDebug
 ```
 
-Release builds use the same flavor names:
+Individual release builds use the same flavor names:
 
 ```sh
 ./gradlew :app:assembleUnexpectedTracksRelease
@@ -49,7 +63,7 @@ The build command may need Android SDK and Java available on the host machine.
 Release APK files can be signed after a release build with one password prompt:
 
 ```sh
-scripts/sign-release-apks.sh 0.1.5-build-37
+scripts/sign-release-apks.sh 0.6.2-build-50
 ```
 
 The script uses `APKSIGNER`, `KEYSTORE`, and `KEY_ALIAS` environment variables when set. Otherwise it uses the local maintainer defaults.
