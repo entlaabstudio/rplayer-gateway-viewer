@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Typeface;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -24,6 +25,7 @@ import android.os.PowerManager;
 import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -616,7 +618,7 @@ public final class MainActivity extends Activity {
      */
     private void scheduleViewerRetry(String reason) {
         mainFrameLoadFailed = true;
-        errorView.setText("Waiting for IPFS gateway connection...\nThe viewer will continue automatically.");
+        errorView.setText(viewerRetryMessage());
         errorView.setVisibility(TextView.VISIBLE);
 
         if (viewerRetryPending) {
@@ -635,6 +637,18 @@ public final class MainActivity extends Activity {
         viewerRetryPending = false;
         mainHandler.removeCallbacks(viewerRetryRunnable);
         errorView.setVisibility(TextView.GONE);
+    }
+
+    /**
+     * Builds the offline startup message shown while the IPFS gateway is unavailable.
+     *
+     * @return Waiting message with the current app version.
+     */
+    private String viewerRetryMessage() {
+        return "Waiting for IPFS gateway connection...\n"
+            + "The viewer will continue automatically.\n\n"
+            + "RPlayer Gateway Viewer\n"
+            + "version: " + BuildConfig.VERSION_NAME;
     }
 
     /**
@@ -1592,8 +1606,10 @@ public final class MainActivity extends Activity {
 
         errorView.setTextColor(0xffffffff);
         errorView.setBackgroundColor(0xff000000);
-        errorView.setTextSize(16);
+        errorView.setTextSize(13);
+        errorView.setGravity(Gravity.CENTER);
         errorView.setPadding(24, 24, 24, 24);
+        errorView.setTypeface(Typeface.create("serif-monospace", Typeface.NORMAL));
         errorView.setVisibility(TextView.GONE);
 
         root.addView(webView, new FrameLayout.LayoutParams(
