@@ -63,7 +63,7 @@ The build command may need Android SDK and Java available on the host machine.
 Release APK files can be signed after a release build with one password prompt:
 
 ```sh
-scripts/sign-release-apks.sh 0.6.2-build-50
+scripts/sign-release-apks.sh 0.6.3-build-51
 ```
 
 The script uses `APKSIGNER`, `KEYSTORE`, and `KEY_ALIAS` environment variables when set. Otherwise it uses the local maintainer defaults.

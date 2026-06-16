@@ -245,6 +245,29 @@
     }
 
     /**
+     * Hooks detached Audio objects created by RPlayer before they are used.
+     *
+     * @param {Window} targetWindow Window object to patch.
+     */
+    function installAudioConstructorHook(targetWindow) {
+        if (!targetWindow.Audio || targetWindow.Audio.RPlayerGatewayViewerAudioConstructorHook) {
+            return;
+        }
+
+        var originalAudio = targetWindow.Audio;
+
+        targetWindow.Audio = function(src) {
+            var mediaElement = new originalAudio(src);
+            rememberMediaElement(mediaElement);
+            return mediaElement;
+        };
+
+        targetWindow.Audio.prototype = originalAudio.prototype;
+        targetWindow.Audio.RPlayerGatewayViewerAudioConstructorHook = true;
+        debugLog('Audio constructor hook installed.');
+    }
+
+    /**
      * Formats buffered media ranges for diagnostics.
      *
      * @param {HTMLMediaElement} mediaElement Media element to inspect.
@@ -410,6 +433,11 @@
         if (mediaElement.RPlayerGatewayPersistentCacheIndicatorHook) {
             return;
         }
+
+        // RPlayer may assign the audio source shortly after the bridge sees the audio object.
+        targetWindow.setTimeout(function() {
+            refreshPersistentAudioCacheState(targetWindow, mediaElement);
+        }, 1000);
 
         debugLog('Persistent audio cache: audio event hook installed.');
 
@@ -741,6 +769,8 @@
             }
         }
 
+        installAudioConstructorHook(targetWindow);
+
         if (targetWindow.HTMLMediaElement && targetWindow.HTMLMediaElement.prototype) {
             var mediaPrototype = targetWindow.HTMLMediaElement.prototype;
 
@@ -792,6 +822,11 @@
                 var rplayerAudioObject = findRPlayerAudioObject(targetWindow);
                 if (rplayerAudioObject) {
                     rememberMediaElement(rplayerAudioObject);
+                } else {
+                    var documentMediaElement = targetWindow.document.querySelector('audio, video');
+                    if (documentMediaElement) {
+                        rememberMediaElement(documentMediaElement);
+                    }
                 }
 
                 sendProgressToAndroid(targetWindow);
